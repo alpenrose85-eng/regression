@@ -1,7 +1,6 @@
 import math
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
@@ -189,15 +188,9 @@ def render_model_block(df, title):
         hide_index=True,
     )
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(pred_df["T_C"], pred_df["T_pred_C"], color="tab:blue", alpha=0.75)
-    min_v = min(pred_df["T_C"].min(), pred_df["T_pred_C"].min())
-    max_v = max(pred_df["T_C"].max(), pred_df["T_pred_C"].max())
-    ax.plot([min_v, max_v], [min_v, max_v], linestyle="--", color="gray")
-    ax.set_xlabel("Наблюдаемая T, °C")
-    ax.set_ylabel("Предсказанная T, °C")
-    ax.set_title("Факт vs прогноз")
-    st.pyplot(fig)
+    chart_df = pred_df[["T_C", "T_pred_C"]].copy().reset_index(drop=True)
+    st.markdown("### График факт / прогноз")
+    st.line_chart(chart_df)
 
     st.markdown("### Влияние каждой точки на качество модели")
     influence_df = calculate_point_influence(df, include_G=include_G)
