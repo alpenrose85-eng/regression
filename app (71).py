@@ -2,8 +2,6 @@ import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
 
 st.set_page_config(page_title="Регрессия по 1/T", layout="wide")
 st.title("Регрессия по 1/T")
@@ -51,14 +49,45 @@ def load_data(uploaded_file):
     return df
 
 
+def rmse(y_true, y_pred):
+    return math.sqrt(np.mean((y_true - y_pred) ** 2))
+
+
+def mae(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
+
+
+def r2_score_np(y_true, y_pred):
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    if ss_tot == 0:
+        return float("nan")
+    return 1 - ss_res / ss_tot
+
+
 def compute_temp_metrics(t_true, t_pred):
     mask = np.isfinite(t_pred)
     if not mask.any():
         return {"rmse": float("nan"), "r2": float("nan"), "mae": float("nan")}
-    rmse = math.sqrt(mean_squared_error(t_true[mask], t_pred[mask]))
-    r2 = r2_score(t_true[mask], t_pred[mask])
-    mae = np.mean(np.abs(t_true[mask] - t_pred[mask]))
-    return {"rmse": rmse, "r2": r2, "mae": mae}
+    y_true = t_true[mask]
+    y_pred = t_pred[mask]
+    return {
+        "rmse": rmse(y_true, y_pred),
+        "r2": r2_score_np(y_true, y_pred),
+        "mae": mae(y_true, y_pred),
+    }
+
+
+def fit_linear_regression(X, y):
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ones = np.ones((X.shape[0], 1))
+    X_design = np.hstack([ones, X])
+    beta, *_ = np.linalg.lstsq(X_design, y, rcond=None)
+    intercept = beta[0]
+    coef = beta[1:]
+    y_pred = X_design @ beta
+    return intercept, coef, y_pred
 
 
 def fit_inverse_temp_model(df, include_G=True):
@@ -77,16 +106,17 @@ def fit_inverse_temp_model(df, include_G=True):
             np.log(c_sigma),
         ])
 
-    target = 1.0 / df["T_K"]
-    model = LinearRegression().fit(features, target)
-    y_pred = model.predict(features)
+    target = 1.0 / df["T_K"].values
+    intercept, coef, y_pred = fit_linear_regression(features, target)
+
     with np.errstate(divide="ignore"):
         t_pred_k = np.where(y_pred > 0, 1.0 / y_pred, np.nan)
 
     metrics = compute_temp_metrics(df["T_C"].values, t_pred_k - 273.15)
 
     return {
-        "model": model,
+        "intercept": intercept,
+        "coef": coef,
         "t_pred_k": t_pred_k,
         "metrics": metrics,
         "include_G": include_G,
@@ -94,8 +124,8 @@ def fit_inverse_temp_model(df, include_G=True):
 
 
 def format_formula(model_data):
-    coef = model_data["model"].coef_
-    intercept = model_data["model"].intercept_
+    coef = model_data["coef"]
+    intercept = model_data["intercept"]
     if model_data["include_G"]:
         return (
             f"1/T = {intercept:.8f} + ({coef[0]:.8f})·ln(D) + ({coef[1]:.8f})·ln(τ) + "
@@ -149,8 +179,8 @@ def render_model_block(df, title):
     include_G = df["G"].nunique() > 1
     model_data = fit_inverse_temp_model(df, include_G=include_G)
     formula = format_formula(model_data)
-    coef = model_data["model"].coef_
-    intercept = model_data["model"].intercept_
+    coef = model_data["coef"]
+    intercept = model_data["intercept"]
 
     st.markdown("### Коэффициенты модели")
     coef_rows = [{"Параметр": "intercept", "Значение": intercept}]
