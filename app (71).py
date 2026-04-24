@@ -191,14 +191,14 @@ def approximation_reliability(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return (1 - numerator / denominator) * 100
 
 
-def build_metrics(df: pd.DataFrame) -> dict[str, float]:
+def build_metrics(df: pd.DataFrame, predictor_count: int) -> dict[str, float]:
     y_true = df["T"]
     y_pred = df["T_pred"]
     abs_err = np.abs(df["abs_error"])
     rel_err = np.abs(df["rel_error_pct"])
 
     n = len(df)
-    p = 5
+    p = predictor_count
     r2 = r2_score(y_true, y_pred)
     adj_r2 = 1 - (1 - r2) * (n - 1) / (max(n - p - 1, 1))
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
@@ -227,11 +227,15 @@ def build_metrics(df: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def fit_model(df: pd.DataFrame) -> FitResult:
+def fit_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
 
-    X = df[["ln_D", "ln_tau", "G", "ln_c_sigma"]]
+    feature_columns = ["ln_D", "ln_tau", "ln_c_sigma"]
+    if include_grain:
+        feature_columns.insert(2, "G")
+
+    X = df[feature_columns]
     X = sm.add_constant(X)
     y = df["inv_T"]
 
@@ -265,56 +269,32 @@ def fit_model(df: pd.DataFrame) -> FitResult:
         | (weak_points["cooks_distance"] > 4 / len(result_df))
     ].copy()
 
+    coeff_labels = [
+        ("a", "const"),
+        ("b", "ln_D"),
+        ("c", "ln_tau"),
+    ]
+    if include_grain:
+        coeff_labels.append(("d", "G"))
+        coeff_labels.append(("e", "ln_c_sigma"))
+    else:
+        coeff_labels.append(("d", "ln_c_sigma"))
+
+    conf_int = model.conf_int()
     params = pd.DataFrame(
         {
-            "Коэффициент": ["a", "b", "c", "d", "e"],
-            "Параметр модели": ["const", "ln_D", "ln_tau", "G", "ln_c_sigma"],
-            "Значение": [
-                model.params.get("const", np.nan),
-                model.params.get("ln_D", np.nan),
-                model.params.get("ln_tau", np.nan),
-                model.params.get("G", np.nan),
-                model.params.get("ln_c_sigma", np.nan),
-            ],
-            "StdErr": [
-                model.bse.get("const", np.nan),
-                model.bse.get("ln_D", np.nan),
-                model.bse.get("ln_tau", np.nan),
-                model.bse.get("G", np.nan),
-                model.bse.get("ln_c_sigma", np.nan),
-            ],
-            "t-статистика": [
-                model.tvalues.get("const", np.nan),
-                model.tvalues.get("ln_D", np.nan),
-                model.tvalues.get("ln_tau", np.nan),
-                model.tvalues.get("G", np.nan),
-                model.tvalues.get("ln_c_sigma", np.nan),
-            ],
-            "p-value": [
-                model.pvalues.get("const", np.nan),
-                model.pvalues.get("ln_D", np.nan),
-                model.pvalues.get("ln_tau", np.nan),
-                model.pvalues.get("G", np.nan),
-                model.pvalues.get("ln_c_sigma", np.nan),
-            ],
-            "Нижняя 95% граница": [
-                model.conf_int().loc["const", 0],
-                model.conf_int().loc["ln_D", 0],
-                model.conf_int().loc["ln_tau", 0],
-                model.conf_int().loc["G", 0],
-                model.conf_int().loc["ln_c_sigma", 0],
-            ],
-            "Верхняя 95% граница": [
-                model.conf_int().loc["const", 1],
-                model.conf_int().loc["ln_D", 1],
-                model.conf_int().loc["ln_tau", 1],
-                model.conf_int().loc["G", 1],
-                model.conf_int().loc["ln_c_sigma", 1],
-            ],
+            "Коэффициент": [label for label, _ in coeff_labels],
+            "Параметр модели": [param for _, param in coeff_labels],
+            "Значение": [model.params.get(param, np.nan) for _, param in coeff_labels],
+            "StdErr": [model.bse.get(param, np.nan) for _, param in coeff_labels],
+            "t-статистика": [model.tvalues.get(param, np.nan) for _, param in coeff_labels],
+            "p-value": [model.pvalues.get(param, np.nan) for _, param in coeff_labels],
+            "Нижняя 95% граница": [conf_int.loc[param, 0] for _, param in coeff_labels],
+            "Верхняя 95% граница": [conf_int.loc[param, 1] for _, param in coeff_labels],
         }
     )
 
-    metrics = build_metrics(result_df)
+    metrics = build_metrics(result_df, predictor_count=len(feature_columns))
 
     return FitResult(
         data=result_df,
@@ -405,23 +385,32 @@ def qq_plot(df: pd.DataFrame, title: str) -> None:
     plt.close(fig)
 
 
-def show_result_block(result: FitResult, key_prefix: str = "main") -> None:
+def show_result_block(result: FitResult, key_prefix: str = "main", include_grain: bool = True) -> None:
     st.subheader("Показатели качества модели")
     metric_cards(result.metrics)
 
     st.subheader("Коэффициенты модели")
     st.dataframe(result.params, use_container_width=True, hide_index=True)
 
-    formula_parts = result.params.set_index("Коэффициент")["Значение"].to_dict()
-    st.code(
-        "1 / T(K) = "
-        f"{formula_parts['a']:.8f} "
-        f"+ ({formula_parts['b']:.8f})·ln(D) "
-        f"+ ({formula_parts['c']:.8f})·ln(τ) "
-        f"+ ({formula_parts['d']:.8f})·G "
-        f"+ ({formula_parts['e']:.8f})·ln(cσ)",
-        language="text",
-    )
+    param_map = result.params.set_index("Параметр модели")["Значение"].to_dict()
+    if include_grain:
+        formula_text = (
+            "1 / T(K) = "
+            f"{param_map['const']:.8f} "
+            f"+ ({param_map['ln_D']:.8f})·ln(D) "
+            f"+ ({param_map['ln_tau']:.8f})·ln(τ) "
+            f"+ ({param_map['G']:.8f})·G "
+            f"+ ({param_map['ln_c_sigma']:.8f})·ln(cσ)"
+        )
+    else:
+        formula_text = (
+            "1 / T(K) = "
+            f"{param_map['const']:.8f} "
+            f"+ ({param_map['ln_D']:.8f})·ln(D) "
+            f"+ ({param_map['ln_tau']:.8f})·ln(τ) "
+            f"+ ({param_map['ln_c_sigma']:.8f})·ln(cσ)"
+        )
+    st.code(formula_text, language="text")
 
     st.subheader("Точки с наибольшим влиянием / отклонением")
     weak_view = result.weak_points[
@@ -451,7 +440,7 @@ def show_result_block(result: FitResult, key_prefix: str = "main") -> None:
             filtered = result.data[~result.data["point_id"].astype(str).isin(selected)].copy()
             if len(filtered) >= 7:
                 st.info(f"Пересчет после исключения {len(selected)} точек.")
-                recalculated = fit_model(filtered)
+                recalculated = fit_model(filtered, include_grain=include_grain)
                 metric_cards(recalculated.metrics)
                 st.dataframe(
                     recalculated.params,
@@ -523,7 +512,7 @@ main_tab, grain_tab = st.tabs(["Общая модель", "Модели по н�
 with main_tab:
     try:
         result = fit_model(prepared_df)
-        show_result_block(result, key_prefix="all")
+        show_result_block(result, key_prefix="all", include_grain=True)
     except Exception as exc:
         st.error(f"Не удалось построить общую модель: {exc}")
 
@@ -543,7 +532,7 @@ with grain_tab:
         for grain in valid_grains:
             grain_df = prepared_df[prepared_df["G"] == grain].copy()
             try:
-                grain_result = fit_model(grain_df)
+                grain_result = fit_model(grain_df, include_grain=False)
                 grain_scores.append(
                     {
                         "Номер зерна": grain,
@@ -558,7 +547,7 @@ with grain_tab:
                     }
                 )
                 if grain == selected_grain:
-                    show_result_block(grain_result, key_prefix=f"grain_{grain}")
+                    show_result_block(grain_result, key_prefix=f"grain_{grain}", include_grain=False)
             except Exception:
                 continue
 
