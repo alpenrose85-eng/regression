@@ -587,6 +587,18 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
 
     metrics = build_metrics(result_df, predictor_count=len(param_rows))
     metrics["RMSE модели сигма-фазы, %"] = float(np.sqrt(mean_squared_error(x_true, x_pred)))
+    real_point_temp = solve_temperature_from_sigma(
+        REAL_WORLD_POINT["c_sigma"],
+        REAL_WORLD_POINT["tau"],
+        REAL_WORLD_POINT["G"] if include_grain else None,
+    )
+    metrics["Прогноз для реальной точки, °C"] = float(real_point_temp)
+    if REAL_WORLD_POINT["temp_min"] <= real_point_temp <= REAL_WORLD_POINT["temp_max"]:
+        metrics["Отклонение реальной точки от диапазона, °C"] = 0.0
+    elif real_point_temp < REAL_WORLD_POINT["temp_min"]:
+        metrics["Отклонение реальной точки от диапазона, °C"] = REAL_WORLD_POINT["temp_min"] - real_point_temp
+    else:
+        metrics["Отклонение реальной точки от диапазона, °C"] = real_point_temp - REAL_WORLD_POINT["temp_max"]
 
     formula_text = (
         "cσ = 18·{1 - exp[-A·τ^p·((T-550)/350)^m·exp(-g·G)]}\n"
