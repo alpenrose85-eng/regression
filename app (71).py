@@ -725,6 +725,87 @@ def qq_plot(df: pd.DataFrame, title: str) -> None:
     plt.close(fig)
 
 
+def sigma_metric_summary(df: pd.DataFrame) -> dict[str, float]:
+    y_true = df["c_sigma"].to_numpy(dtype=float)
+    y_pred = df["sigma_pred_pct"].to_numpy(dtype=float)
+    sigma_error = y_true - y_pred
+    return {
+        "Количество точек": float(len(df)),
+        "R² по cσ": float(r2_score(y_true, y_pred)) if len(df) >= 2 else np.nan,
+        "RMSE по cσ, %": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE по cσ, %": float(mean_absolute_error(y_true, y_pred)),
+        "MAPE по cσ, %": float(np.mean(np.abs(sigma_error) / np.maximum(np.abs(y_true), 1e-9)) * 100.0),
+        "Корреляция факт/модель по cσ": float(np.corrcoef(y_true, y_pred)[0, 1]) if len(df) >= 2 else np.nan,
+    }
+
+
+def sigma_scatter_fact_vs_pred(df: pd.DataFrame, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(df["c_sigma"], df["sigma_pred_pct"], color="#1f77b4", s=70, alpha=0.8)
+    low = min(df["c_sigma"].min(), df["sigma_pred_pct"].min())
+    high = max(df["c_sigma"].max(), df["sigma_pred_pct"].max())
+    ax.plot([low, high], [low, high], "r--", linewidth=1.5, label="Идеальное совпадение")
+    ax.set_xlabel("Экспериментальное cσ, %")
+    ax.set_ylabel("Расчетное cσ, %")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def sigma_vs_temperature_plot(df: pd.DataFrame, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sorted_df = df.sort_values("T")
+    ax.scatter(sorted_df["T"], sorted_df["c_sigma"], color="#1f77b4", s=60, label="Эксперимент")
+    ax.plot(sorted_df["T"], sorted_df["sigma_pred_pct"], color="#d62728", linewidth=2, marker="o", label="Модель")
+    ax.set_xlabel("Температура, °C")
+    ax.set_ylabel("Содержание сигма-фазы cσ, %")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def sigma_vs_time_plot(df: pd.DataFrame, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sorted_df = df.sort_values("tau")
+    ax.scatter(sorted_df["tau"], sorted_df["c_sigma"], color="#1f77b4", s=60, label="Эксперимент")
+    ax.plot(sorted_df["tau"], sorted_df["sigma_pred_pct"], color="#2ca02c", linewidth=2, marker="o", label="Модель")
+    ax.set_xscale("log")
+    ax.set_xlabel("Время τ, ч (log)")
+    ax.set_ylabel("Содержание сигма-фазы cσ, %")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
+    st.subheader(f"Sigma-модель для номера зерна {grain_value}")
+    sigma_metrics = sigma_metric_summary(result.data)
+    metric_cards(sigma_metrics)
+    st.subheader("Коэффициенты модели")
+    st.dataframe(result.params, use_container_width=True, hide_index=True)
+    st.caption(result.model_label)
+    st.code(result.formula_text, language="text")
+    st.subheader("Таблица по точкам")
+    sigma_view = result.data[["point_id", "T", "tau", "G", "c_sigma", "sigma_pred_pct", "T_pred", "error_celsius"]].copy()
+    sigma_view["Ошибка по cσ, %"] = sigma_view["c_sigma"] - sigma_view["sigma_pred_pct"]
+    st.dataframe(sigma_view, use_container_width=True, hide_index=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        sigma_scatter_fact_vs_pred(result.data, "Эксперимент vs модель по cσ")
+        sigma_vs_temperature_plot(result.data, "Зависимость cσ от температуры")
+    with c2:
+        sigma_vs_time_plot(result.data, "Зависимость cσ от времени")
+        residual_plot(result.data.assign(error_celsius=result.data["c_sigma"] - result.data["sigma_pred_pct"]), "Остатки по cσ")
+    with st.expander("Подробная статистическая сводка"):
+        st.text(result.model_summary)
+
+
 def predict_temperature_engineering(params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None) -> float:
     inv_t = (
         params.get("const", 0.0)
@@ -1189,26 +1270,42 @@ with improved_tab:
 
 with anchor_tab:
     st.write(
-        "Новая модель строится отдельно для каждого номера зерна. "
-        "Для каждого G подбирается своя простая степенная зависимость по содержанию сигма-фазы, времени и температуре. "
-        "После этого температура восстанавливается уже по подмодели соответствующего зерна."
+        "Здесь показаны отдельные простые модели содержания сигма-фазы для каждого номера зерна. "
+        "Для каждого G зависимость строится отдельно по температуре и времени, с собственными коэффициентами, графиками и оценкой качества."
     )
-    try:
-        if anchor_result is None:
-            raise ValueError(anchor_error or "неизвестная ошибка")
-        show_result_block(
-            anchor_result,
-            key_prefix="anchor_all",
-            include_grain=True,
-            fit_function=fit_anchor_saturation_model,
-        )
-        st.info(
-            f"Прогноз для реальной точки (τ={REAL_WORLD_POINT['tau']:.0f} ч, D={REAL_WORLD_POINT['D']}, "
-            f"cσ={REAL_WORLD_POINT['c_sigma']}, G={REAL_WORLD_POINT['G']:.0f}) = "
-            f"{anchor_result.metrics.get('Прогноз для реальной точки, °C', np.nan):.4f} °C."
-        )
-    except Exception as exc:
-        st.error(f"Не удалось построить sigma-модель по отдельным зернам: {exc}")
+    sigma_grain_scores: list[dict[str, float]] = []
+    if not valid_grains:
+        st.warning("Для отдельных номеров зерна пока недостаточно точек. Нужно минимум 7 точек на номер зерна.")
+    else:
+        selected_sigma_grain = st.selectbox("Выберите номер зерна для sigma-модели", valid_grains)
+        for grain in valid_grains:
+            grain_df = prepared_df[prepared_df["G"] == grain].copy()
+            try:
+                grain_result = fit_anchor_saturation_model(grain_df, include_grain=False)
+                sigma_metrics = sigma_metric_summary(grain_result.data)
+                sigma_grain_scores.append(
+                    {
+                        "Номер зерна": grain,
+                        **sigma_metrics,
+                    }
+                )
+                if grain == selected_sigma_grain:
+                    show_sigma_grain_block(grain_result, grain)
+            except Exception:
+                continue
+
+        if sigma_grain_scores:
+            st.subheader("Сравнение sigma-моделей по номерам зерна")
+            sigma_score_df = pd.DataFrame(sigma_grain_scores).sort_values(
+                by=["R² по cσ", "RMSE по cσ, %", "MAPE по cσ, %"],
+                ascending=[False, True, True],
+            )
+            st.dataframe(sigma_score_df, use_container_width=True, hide_index=True)
+            best_sigma_grain = sigma_score_df.iloc[0]
+            st.info(
+                f"Лучше всего sigma-модель сейчас выглядит для номера зерна {best_sigma_grain['Номер зерна']}: "
+                f"R² по cσ={best_sigma_grain['R² по cσ']:.4f}, RMSE по cσ={best_sigma_grain['RMSE по cσ, %']:.4f} %"
+            )
 
 with compare_tab:
     if base_result is None:
