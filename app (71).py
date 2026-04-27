@@ -1014,6 +1014,8 @@ if base_result is not None:
     enrich_real_point_metrics(base_result, predict_temperature_engineering)
 if improved_result is not None:
     enrich_real_point_metrics(improved_result, predict_temperature_improved)
+if anchor_result is not None:
+    enrich_real_point_metrics(anchor_result, predict_temperature_anchor_saturation)
 
 main_tab, grain_tab, improved_tab, anchor_tab, compare_tab, calculator_tab = st.tabs([
     "Общая модель",
