@@ -75,6 +75,8 @@ class FitResult:
     weak_points: pd.DataFrame
     model_summary: str
     outlier_recommendation: pd.DataFrame
+    formula_text: str
+    model_label: str
 
 
 def normalize_name(name: str) -> str:
@@ -227,7 +229,7 @@ def build_metrics(df: pd.DataFrame, predictor_count: int) -> dict[str, float]:
     }
 
 
-def fit_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
+def fit_engineering_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
 
@@ -296,6 +298,16 @@ def fit_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
 
     metrics = build_metrics(result_df, predictor_count=len(feature_columns))
 
+    formula_text = (
+        "1 / T(K) = "
+        f"{model.params.get('const', np.nan):.8f} "
+        f"+ ({model.params.get('ln_D', np.nan):.8f})·ln(D) "
+        f"+ ({model.params.get('ln_tau', np.nan):.8f})·ln(τ) "
+    )
+    if include_grain:
+        formula_text += f"+ ({model.params.get('G', np.nan):.8f})·G "
+    formula_text += f"+ ({model.params.get('ln_c_sigma', np.nan):.8f})·ln(cσ)"
+
     return FitResult(
         data=result_df,
         metrics=metrics,
@@ -303,6 +315,120 @@ def fit_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
         weak_points=weak_points,
         model_summary=model.summary().as_text(),
         outlier_recommendation=outlier_recommendation,
+        formula_text=formula_text,
+        model_label="Базовая инженерная модель",
+    )
+
+
+def fit_improved_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
+    if len(df) < 7:
+        raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
+
+    feature_columns = ["ln_tau", "inv_T", "ln_c_sigma"]
+    if include_grain:
+        feature_columns.insert(2, "G")
+
+    X = sm.add_constant(df[feature_columns])
+    y = df["ln_D"]
+
+    model = sm.OLS(y, X).fit()
+    influence = model.get_influence()
+
+    a2 = model.params.get("inv_T", np.nan)
+    if not np.isfinite(a2) or abs(a2) < 1e-12:
+        raise ValueError(
+            "Коэффициент при 1/T в улучшенной модели оказался слишком мал. Невозможно устойчиво восстановить температуру."
+        )
+
+    numerator = (
+        df["ln_D"]
+        - model.params.get("const", 0.0)
+        - model.params.get("ln_tau", 0.0) * df["ln_tau"]
+        - model.params.get("ln_c_sigma", 0.0) * df["ln_c_sigma"]
+    )
+    if include_grain:
+        numerator = numerator - model.params.get("G", 0.0) * df["G"]
+
+    fitted_inv_t = numerator / a2
+    if np.any(fitted_inv_t <= 0):
+        raise ValueError(
+            "Улучшенная модель дала неположительные значения 1/T. Проверьте диапазон данных или исключите выбросы."
+        )
+
+    fitted_kelvin = 1.0 / fitted_inv_t
+    fitted_c = fitted_kelvin - 273.15
+
+    result_df = df.copy()
+    result_df["ln_D_pred"] = model.predict(X)
+    result_df["inv_T_pred"] = fitted_inv_t
+    result_df["T_pred"] = fitted_c
+    result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
+    result_df["abs_error"] = np.abs(result_df["error_celsius"])
+    result_df["rel_error_pct"] = np.where(
+        result_df["T"] != 0,
+        result_df["abs_error"] / np.abs(result_df["T"]) * 100,
+        np.nan,
+    )
+    result_df["standard_residual"] = influence.resid_studentized_internal
+    result_df["leverage"] = influence.hat_matrix_diag
+    result_df["cooks_distance"] = influence.cooks_distance[0]
+
+    weak_points = result_df.sort_values(
+        by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
+    ).copy()
+
+    outlier_recommendation = weak_points[
+        (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
+        | (np.abs(weak_points["standard_residual"]) > 2)
+        | (weak_points["cooks_distance"] > 4 / len(result_df))
+    ].copy()
+
+    coeff_labels = [
+        ("a0", "const"),
+        ("a1", "ln_tau"),
+        ("a2", "inv_T"),
+    ]
+    if include_grain:
+        coeff_labels.append(("a3", "G"))
+        coeff_labels.append(("a4", "ln_c_sigma"))
+    else:
+        coeff_labels.append(("a3", "ln_c_sigma"))
+
+    conf_int = model.conf_int()
+    params = pd.DataFrame(
+        {
+            "Коэффициент": [label for label, _ in coeff_labels],
+            "Параметр модели": [param for _, param in coeff_labels],
+            "Значение": [model.params.get(param, np.nan) for _, param in coeff_labels],
+            "StdErr": [model.bse.get(param, np.nan) for _, param in coeff_labels],
+            "t-статистика": [model.tvalues.get(param, np.nan) for _, param in coeff_labels],
+            "p-value": [model.pvalues.get(param, np.nan) for _, param in coeff_labels],
+            "Нижняя 95% граница": [conf_int.loc[param, 0] for _, param in coeff_labels],
+            "Верхняя 95% граница": [conf_int.loc[param, 1] for _, param in coeff_labels],
+        }
+    )
+
+    metrics = build_metrics(result_df, predictor_count=len(feature_columns))
+
+    formula_text = (
+        "ln(D) = "
+        f"{model.params.get('const', np.nan):.8f} "
+        f"+ ({model.params.get('ln_tau', np.nan):.8f})·ln(τ) "
+        f"+ ({model.params.get('inv_T', np.nan):.8f})·(1/T(K)) "
+    )
+    if include_grain:
+        formula_text += f"+ ({model.params.get('G', np.nan):.8f})·G "
+    formula_text += f"+ ({model.params.get('ln_c_sigma', np.nan):.8f})·ln(cσ)"
+
+    return FitResult(
+        data=result_df,
+        metrics=metrics,
+        params=params,
+        weak_points=weak_points,
+        model_summary=model.summary().as_text(),
+        outlier_recommendation=outlier_recommendation,
+        formula_text=formula_text,
+        model_label="Улучшенная физически ориентированная модель",
     )
 
 
@@ -385,32 +511,122 @@ def qq_plot(df: pd.DataFrame, title: str) -> None:
     plt.close(fig)
 
 
-def show_result_block(result: FitResult, key_prefix: str = "main", include_grain: bool = True) -> None:
+def predict_temperature_engineering(params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None) -> float:
+    inv_t = (
+        params.get("const", 0.0)
+        + params.get("ln_D", 0.0) * np.log(D)
+        + params.get("ln_tau", 0.0) * np.log(tau)
+        + params.get("ln_c_sigma", 0.0) * np.log(c_sigma)
+    )
+    if G is not None and "G" in params:
+        inv_t += params.get("G", 0.0) * G
+    if inv_t <= 0:
+        raise ValueError("Базовая модель дала неположительное значение 1/T. Проверьте введенные параметры.")
+    return 1.0 / inv_t - 273.15
+
+
+def predict_temperature_improved(params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None) -> float:
+    a2 = params.get("inv_T", np.nan)
+    if not np.isfinite(a2) or abs(a2) < 1e-12:
+        raise ValueError("В улучшенной модели коэффициент при 1/T слишком мал для устойчивого расчета.")
+
+    numerator = (
+        np.log(D)
+        - params.get("const", 0.0)
+        - params.get("ln_tau", 0.0) * np.log(tau)
+        - params.get("ln_c_sigma", 0.0) * np.log(c_sigma)
+    )
+    if G is not None and "G" in params:
+        numerator -= params.get("G", 0.0) * G
+
+    inv_t = numerator / a2
+    if inv_t <= 0:
+        raise ValueError("Улучшенная модель дала неположительное значение 1/T. Проверьте введенные параметры.")
+    return 1.0 / inv_t - 273.15
+
+
+def show_model_comparison(base_result: FitResult, improved_result: FitResult) -> None:
+    st.subheader("Сравнение базовой и улучшенной моделей")
+    metric_order = [
+        "R²",
+        "Скорректированный R²",
+        "RMSE, °C",
+        "MAE, °C",
+        "MAPE, %",
+        "Среднее отклонение, °C",
+        "Стандартное отклонение ошибки, °C",
+        "Максимальное отклонение, °C",
+        "Стандартная ошибка регрессии",
+        "Корреляция факт/модель",
+        "Коэффициент достоверности аппроксимации, %",
+    ]
+    comparison_df = pd.DataFrame(
+        {
+            "Метрика": metric_order,
+            "Базовая модель": [base_result.metrics.get(metric, np.nan) for metric in metric_order],
+            "Улучшенная модель": [improved_result.metrics.get(metric, np.nan) for metric in metric_order],
+        }
+    )
+    comparison_df["Разница (улучшенная - базовая)"] = (
+        comparison_df["Улучшенная модель"] - comparison_df["Базовая модель"]
+    )
+    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+
+def show_dual_calculator(base_result: FitResult, improved_result: FitResult) -> None:
+    st.subheader("Калькулятор температуры по двум моделям")
+    st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой и улучшенной моделям.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        tau_value = st.number_input("Время наработки τ", min_value=1e-9, value=1000.0, step=100.0, format="%.6f")
+    with c2:
+        d_value = st.number_input("Эквивалентный диаметр D", min_value=1e-9, value=10.0, step=0.1, format="%.6f")
+    with c3:
+        sigma_value = st.number_input("Содержание сигма-фазы cσ, %", min_value=1e-9, value=1.0, step=0.1, format="%.6f")
+    with c4:
+        grain_value = st.number_input("Номер зерна G", value=8.0, step=1.0, format="%.6f")
+
+    base_params = base_result.params.set_index("Параметр модели")["Значение"].to_dict()
+    improved_params = improved_result.params.set_index("Параметр модели")["Значение"].to_dict()
+
+    try:
+        base_temp = predict_temperature_engineering(base_params, d_value, tau_value, sigma_value, grain_value)
+        improved_temp = predict_temperature_improved(improved_params, d_value, tau_value, sigma_value, grain_value)
+
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            st.metric("Температура по базовой модели, °C", f"{base_temp:.4f}")
+        with r2:
+            st.metric("Температура по улучшенной модели, °C", f"{improved_temp:.4f}")
+        with r3:
+            st.metric("Разница, °C", f"{(improved_temp - base_temp):.4f}")
+
+        calc_df = pd.DataFrame(
+            [
+                {"Модель": "Базовая", "Расчетная температура, °C": base_temp},
+                {"Модель": "Улучшенная", "Расчетная температура, °C": improved_temp},
+            ]
+        )
+        st.dataframe(calc_df, use_container_width=True, hide_index=True)
+    except Exception as exc:
+        st.error(f"Не удалось выполнить расчет: {exc}")
+
+
+def show_result_block(
+    result: FitResult,
+    key_prefix: str = "main",
+    include_grain: bool = True,
+    fit_function=fit_engineering_model,
+) -> None:
     st.subheader("Показатели качества модели")
     metric_cards(result.metrics)
 
     st.subheader("Коэффициенты модели")
     st.dataframe(result.params, use_container_width=True, hide_index=True)
 
-    param_map = result.params.set_index("Параметр модели")["Значение"].to_dict()
-    if include_grain:
-        formula_text = (
-            "1 / T(K) = "
-            f"{param_map['const']:.8f} "
-            f"+ ({param_map['ln_D']:.8f})·ln(D) "
-            f"+ ({param_map['ln_tau']:.8f})·ln(τ) "
-            f"+ ({param_map['G']:.8f})·G "
-            f"+ ({param_map['ln_c_sigma']:.8f})·ln(cσ)"
-        )
-    else:
-        formula_text = (
-            "1 / T(K) = "
-            f"{param_map['const']:.8f} "
-            f"+ ({param_map['ln_D']:.8f})·ln(D) "
-            f"+ ({param_map['ln_tau']:.8f})·ln(τ) "
-            f"+ ({param_map['ln_c_sigma']:.8f})·ln(cσ)"
-        )
-    st.code(formula_text, language="text")
+    st.caption(result.model_label)
+    st.code(result.formula_text, language="text")
 
     st.subheader("Точки с наибольшим влиянием / отклонением")
     weak_view = result.weak_points[
@@ -440,13 +656,14 @@ def show_result_block(result: FitResult, key_prefix: str = "main", include_grain
             filtered = result.data[~result.data["point_id"].astype(str).isin(selected)].copy()
             if len(filtered) >= 7:
                 st.info(f"Пересчет после исключения {len(selected)} точек.")
-                recalculated = fit_model(filtered, include_grain=include_grain)
+                recalculated = fit_function(filtered, include_grain=include_grain)
                 metric_cards(recalculated.metrics)
                 st.dataframe(
                     recalculated.params,
                     use_container_width=True,
                     hide_index=True,
                 )
+                st.code(recalculated.formula_text, language="text")
             else:
                 st.error("После исключения осталось слишком мало точек для устойчивой подгонки.")
 
@@ -482,7 +699,8 @@ def show_result_block(result: FitResult, key_prefix: str = "main", include_grain
 
 st.title("Подбор регрессионной модели для экспериментальных точек")
 st.write(
-    "Модель: 1 / T = a + b·ln(D) + c·ln(τ) + d·G + e·ln(cσ), где T внутри расчета переводится в Кельвины."
+    "Приложение поддерживает базовую инженерную модель и улучшенную физически ориентированную альтернативу. "
+    "Во всех расчетах температура внутри формул переводится в Кельвины."
 )
 
 uploaded_file = st.file_uploader(
@@ -507,14 +725,33 @@ with st.expander("Предпросмотр исходных данных"):
 
 st.success(f"Загружено корректных точек: {len(prepared_df)}")
 
-main_tab, grain_tab = st.tabs(["Общая модель", "Модели по номерам зерна"])
+base_result = None
+base_error = None
+try:
+    base_result = fit_engineering_model(prepared_df)
+except Exception as exc:
+    base_error = str(exc)
+
+improved_result = None
+improved_error = None
+try:
+    improved_result = fit_improved_model(prepared_df)
+except Exception as exc:
+    improved_error = str(exc)
+
+main_tab, grain_tab, improved_tab, compare_tab, calculator_tab = st.tabs([
+    "Общая модель",
+    "Модели по номерам зерна",
+    "Улучшенная модель",
+    "Сравнение моделей",
+    "Калькулятор",
+])
 
 with main_tab:
-    try:
-        result = fit_model(prepared_df)
-        show_result_block(result, key_prefix="all", include_grain=True)
-    except Exception as exc:
-        st.error(f"Не удалось построить общую модель: {exc}")
+    if base_result is not None:
+        show_result_block(base_result, key_prefix="all", include_grain=True, fit_function=fit_engineering_model)
+    else:
+        st.error(f"Не удалось построить общую модель: {base_error}")
 
 with grain_tab:
     grain_scores: list[dict[str, float]] = []
@@ -532,7 +769,7 @@ with grain_tab:
         for grain in valid_grains:
             grain_df = prepared_df[prepared_df["G"] == grain].copy()
             try:
-                grain_result = fit_model(grain_df, include_grain=False)
+                grain_result = fit_engineering_model(grain_df, include_grain=False)
                 grain_scores.append(
                     {
                         "Номер зерна": grain,
@@ -547,7 +784,12 @@ with grain_tab:
                     }
                 )
                 if grain == selected_grain:
-                    show_result_block(grain_result, key_prefix=f"grain_{grain}", include_grain=False)
+                    show_result_block(
+                        grain_result,
+                        key_prefix=f"grain_{grain}",
+                        include_grain=False,
+                        fit_function=fit_engineering_model,
+                    )
             except Exception:
                 continue
 
@@ -563,3 +805,118 @@ with grain_tab:
                 f"Лучше всего модель выглядит для номера зерна {best_grain['Номер зерна']}: "
                 f"R²={best_grain['R²']:.4f}, RMSE={best_grain['RMSE, °C']:.4f} °C."
             )
+
+with improved_tab:
+    st.write(
+        "Улучшенная модель из научного заключения: ln(D) = a0 + a1·ln(τ) + a2·(1/T) + a3·G + a4·ln(cσ). "
+        "Для удобства ученого программа, как и раньше, пересчитывает из этой зависимости температуру и показывает все те же метрики, графики и слабые точки."
+    )
+
+    improved_main_tab, improved_grain_tab = st.tabs([
+        "Общая улучшенная модель",
+        "Улучшенные модели по номерам зерна",
+    ])
+
+    with improved_main_tab:
+        try:
+            if improved_result is None:
+                raise ValueError(improved_error or "неизвестная ошибка")
+            show_result_block(
+                improved_result,
+                key_prefix="improved_all",
+                include_grain=True,
+                fit_function=fit_improved_model,
+            )
+        except Exception as exc:
+            st.error(f"Не удалось построить улучшенную модель: {exc}")
+
+    with improved_grain_tab:
+        improved_grain_scores: list[dict[str, float]] = []
+
+        if not valid_grains:
+            st.warning("Для отдельных номеров зерна пока недостаточно точек. Нужно минимум 7 точек на номер зерна.")
+        else:
+            selected_improved_grain = st.selectbox(
+                "Выберите номер зерна для улучшенной модели",
+                valid_grains,
+            )
+            for grain in valid_grains:
+                grain_df = prepared_df[prepared_df["G"] == grain].copy()
+                try:
+                    grain_result = fit_improved_model(grain_df, include_grain=False)
+                    improved_grain_scores.append(
+                        {
+                            "Номер зерна": grain,
+                            "Количество точек": grain_result.metrics["Количество точек"],
+                            "R²": grain_result.metrics["R²"],
+                            "RMSE, °C": grain_result.metrics["RMSE, °C"],
+                            "MAE, °C": grain_result.metrics["MAE, °C"],
+                            "MAPE, %": grain_result.metrics["MAPE, %"],
+                            "Коэффициент достоверности аппроксимации, %": grain_result.metrics[
+                                "Коэффициент достоверности аппроксимации, %"
+                            ],
+                        }
+                    )
+                    if grain == selected_improved_grain:
+                        show_result_block(
+                            grain_result,
+                            key_prefix=f"improved_grain_{grain}",
+                            include_grain=False,
+                            fit_function=fit_improved_model,
+                        )
+                except Exception:
+                    continue
+
+            if improved_grain_scores:
+                st.subheader("Сравнение качества улучшенной модели по номерам зерна")
+                score_df = pd.DataFrame(improved_grain_scores).sort_values(
+                    by=["R²", "RMSE, °C", "MAPE, %"],
+                    ascending=[False, True, True],
+                )
+                st.dataframe(score_df, use_container_width=True, hide_index=True)
+                best_grain = score_df.iloc[0]
+                st.info(
+                    f"Лучше всего улучшенная модель выглядит для номера зерна {best_grain['Номер зерна']}: "
+                    f"R²={best_grain['R²']:.4f}, RMSE={best_grain['RMSE, °C']:.4f} °C."
+                )
+
+with compare_tab:
+    if base_result is None:
+        st.error(f"Базовая модель недоступна для сравнения: {base_error}")
+    elif improved_result is None:
+        st.error(f"Улучшенная модель недоступна для сравнения: {improved_error}")
+    else:
+        show_model_comparison(base_result, improved_result)
+
+        grain_compare_rows: list[dict[str, float]] = []
+        for grain in valid_grains:
+            grain_df = prepared_df[prepared_df["G"] == grain].copy()
+            try:
+                base_grain_result = fit_engineering_model(grain_df, include_grain=False)
+                improved_grain_result = fit_improved_model(grain_df, include_grain=False)
+                grain_compare_rows.append(
+                    {
+                        "Номер зерна": grain,
+                        "R² базовая": base_grain_result.metrics["R²"],
+                        "R² улучшенная": improved_grain_result.metrics["R²"],
+                        "RMSE базовая, °C": base_grain_result.metrics["RMSE, °C"],
+                        "RMSE улучшенная, °C": improved_grain_result.metrics["RMSE, °C"],
+                        "MAPE базовая, %": base_grain_result.metrics["MAPE, %"],
+                        "MAPE улучшенная, %": improved_grain_result.metrics["MAPE, %"],
+                    }
+                )
+            except Exception:
+                continue
+
+        if grain_compare_rows:
+            st.subheader("Сравнение моделей по номерам зерна")
+            grain_compare_df = pd.DataFrame(grain_compare_rows)
+            st.dataframe(grain_compare_df, use_container_width=True, hide_index=True)
+
+with calculator_tab:
+    if base_result is None:
+        st.error(f"Калькулятор базовой модели недоступен: {base_error}")
+    elif improved_result is None:
+        st.error(f"Калькулятор улучшенной модели недоступен: {improved_error}")
+    else:
+        show_dual_calculator(base_result, improved_result)
