@@ -809,7 +809,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
                 ),
             },
             {
-                "Модель": "JMAK/Avrami sigma-модель"},{
+                "Модель": "JMAK/Avrami sigma-модель",
                 "Прогноз для реальной точки, °C": anchor_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
                 "Отклонение от диапазона 570–600 °C, °C": anchor_result.metrics.get(
                     "Отклонение реальной точки от диапазона, °C", np.nan
