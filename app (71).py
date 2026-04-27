@@ -1219,7 +1219,7 @@ def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
         key_prefix=f"diameter_grain_{grain_value}",
         include_grain=False,
         fit_function=fit_diameter_growth_model,
-        preselect_outliers=False,
+        preselect_outliers=True,
     )
 
 
