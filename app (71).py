@@ -471,80 +471,84 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
 
-    def fit_single_grain(grain_df: pd.DataFrame) -> tuple[sm.regression.linear_model.RegressionResultsWrapper, np.ndarray, np.ndarray]:
-        X = sm.add_constant(grain_df[["ln_tau", "inv_T"]])
-        y = grain_df["sigma_saturation_logit"]
-        model = sm.OLS(y, X).fit()
-        inv_coef = model.params.get("inv_T", np.nan)
-        if not np.isfinite(inv_coef) or abs(inv_coef) < 1e-12:
-            raise ValueError("Коэффициент при 1/T слишком мал для обратного расчета температуры.")
-        pred_logit = model.predict(X).to_numpy(dtype=float)
-        pred_sigma = SIGMA_SATURATION_LIMIT / (1.0 + np.exp(-pred_logit))
-        return model, pred_logit, pred_sigma
+    def sigma_power_model(params: np.ndarray, tau_vals: np.ndarray, temp_vals: np.ndarray) -> np.ndarray:
+        log_a, p_exp, m_exp = params
+        tau_term = np.power(np.maximum(tau_vals, 1e-12), p_exp)
+        temp_term = np.power(np.clip((temp_vals - 550.0) / 350.0, 1e-9, None), m_exp)
+        return np.exp(log_a) * tau_term * temp_term
+
+    def fit_single_grain(grain_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        tau_vals = grain_df["tau"].to_numpy(dtype=float)
+        temp_vals = grain_df["T"].to_numpy(dtype=float)
+        sigma_true = grain_df["c_sigma"].to_numpy(dtype=float)
+
+        def residuals(params: np.ndarray) -> np.ndarray:
+            pred = sigma_power_model(params, tau_vals, temp_vals)
+            penalty = 1e-5 * np.sum(np.square(params))
+            return np.append(pred - sigma_true, np.sqrt(penalty))
+
+        fit = optimize.least_squares(
+            residuals,
+            x0=np.array([-8.0, 0.35, 0.7], dtype=float),
+            bounds=(np.array([-30.0, 0.01, 0.01], dtype=float), np.array([10.0, 1.5, 4.0], dtype=float)),
+            method="trf",
+            loss="soft_l1",
+            max_nfev=20000,
+        )
+        if not fit.success:
+            raise ValueError(f"Подгонка степенной sigma-модели не сошлась: {fit.message}")
+
+        params_vec = fit.x
+        sigma_pred = np.clip(sigma_power_model(params_vec, tau_vals, temp_vals), 0.0, SIGMA_SATURATION_LIMIT)
+        log_a, p_exp, m_exp = params_vec
+        denom = np.exp(log_a) * np.power(np.maximum(tau_vals, 1e-12), p_exp)
+        temp_norm_pred = np.power(np.maximum(sigma_true / np.maximum(denom, 1e-12), 1e-12), 1.0 / m_exp)
+        temp_pred = np.clip(550.0 + 350.0 * temp_norm_pred, 550.0, 900.0)
+        return params_vec, sigma_pred, temp_pred
 
     def solve_temp_from_model(params: dict[str, float], tau_value: float, sigma_value: float) -> float:
-        logit_value = sigma_saturation_feature(sigma_value)
-        inv_t = (logit_value - params["const"] - params["ln_tau"] * np.log(tau_value)) / params["inv_T"]
-        if not np.isfinite(inv_t) or inv_t <= 0:
-            raise ValueError("Модель по зерну дала неположительное значение 1/T.")
-        return float(1.0 / inv_t - 273.15)
+        if sigma_value <= 0:
+            raise ValueError("Содержание сигма-фазы должно быть больше нуля.")
+        log_a = params["log_a"]
+        p_exp = params["p_exp"]
+        m_exp = params["m_exp"]
+        denom = np.exp(log_a) * np.power(max(tau_value, 1e-12), p_exp)
+        if not np.isfinite(denom) or denom <= 0 or not np.isfinite(m_exp) or abs(m_exp) < 1e-12:
+            raise ValueError("Степенная sigma-модель дала некорректные параметры.")
+        temp_norm = np.power(max(sigma_value / denom, 1e-12), 1.0 / m_exp)
+        return float(np.clip(550.0 + 350.0 * temp_norm, 550.0, 900.0))
 
     if include_grain:
-        result_df = df.copy()
-        result_df["T_pred"] = np.nan
-        result_df["inv_T_pred"] = np.nan
-        result_df["sigma_pred_pct"] = np.nan
+        result_frames: list[pd.DataFrame] = []
         param_rows: list[dict[str, float | str]] = []
         summary_parts: list[str] = []
-        valid_grains: list[float] = []
 
         for grain_value in sorted(df["G"].dropna().unique().tolist()):
             grain_df = df[df["G"] == grain_value].copy()
             if len(grain_df) < 7:
                 summary_parts.append(f"Зерно {grain_value}: пропущено, точек меньше 7.")
                 continue
-            model, pred_logit, pred_sigma = fit_single_grain(grain_df)
-            valid_grains.append(grain_value)
-            grain_params = model.params.to_dict()
-            inv_t_pred = (
-                grain_df["sigma_saturation_logit"] - grain_params["const"] - grain_params["ln_tau"] * grain_df["ln_tau"]
-            ) / grain_params["inv_T"]
-            temp_pred = 1.0 / inv_t_pred - 273.15
-            result_df.loc[grain_df.index, "inv_T_pred"] = inv_t_pred
-            result_df.loc[grain_df.index, "T_pred"] = temp_pred
-            result_df.loc[grain_df.index, "sigma_pred_pct"] = pred_sigma
-            summary_parts.append(f"--- Модель для зерна {grain_value} ---\n{model.summary().as_text()}")
-            for coef_label, coef_name in [("a", "const"), ("b", "ln_tau"), ("c", "inv_T")]:
+            grain_result = fit_anchor_saturation_model(grain_df, include_grain=False)
+            result_frames.append(grain_result.data)
+            summary_parts.append(f"--- Модель для зерна {grain_value} ---\n{grain_result.model_summary}")
+            for _, row in grain_result.params.iterrows():
                 param_rows.append(
                     {
-                        "Коэффициент": f"{coef_label}(G={grain_value})",
-                        "Параметр модели": f"grain_{grain_value}_{coef_name}",
-                        "Значение": model.params.get(coef_name, np.nan),
-                        "StdErr": model.bse.get(coef_name, np.nan),
-                        "t-статистика": model.tvalues.get(coef_name, np.nan),
-                        "p-value": model.pvalues.get(coef_name, np.nan),
-                        "Нижняя 95% граница": model.conf_int().loc[coef_name, 0],
-                        "Верхняя 95% граница": model.conf_int().loc[coef_name, 1],
+                        "Коэффициент": f"{row['Коэффициент']}(G={grain_value})",
+                        "Параметр модели": f"grain_{grain_value}_{row['Параметр модели']}",
+                        "Значение": row["Значение"],
+                        "StdErr": row["StdErr"],
+                        "t-статистика": row["t-статистика"],
+                        "p-value": row["p-value"],
+                        "Нижняя 95% граница": row["Нижняя 95% граница"],
+                        "Верхняя 95% граница": row["Верхняя 95% граница"],
                     }
                 )
 
-        result_df = result_df.dropna(subset=["T_pred"]).copy()
-        if result_df.empty:
+        if not result_frames:
             raise ValueError("Не удалось построить ни одной модели по отдельным зернам: недостаточно данных.")
 
-        result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
-        result_df["abs_error"] = np.abs(result_df["error_celsius"])
-        result_df["rel_error_pct"] = np.where(
-            result_df["T"] != 0,
-            result_df["abs_error"] / np.abs(result_df["T"]) * 100,
-            np.nan,
-        )
-        std_err = result_df["error_celsius"].std(ddof=1)
-        result_df["standard_residual"] = (
-            (result_df["error_celsius"] - result_df["error_celsius"].mean()) / std_err if np.isfinite(std_err) and std_err > 0 else 0.0
-        )
-        result_df["leverage"] = np.nan
-        result_df["cooks_distance"] = np.nan
+        result_df = pd.concat(result_frames, ignore_index=True)
 
         params = pd.DataFrame(param_rows)
         metrics = build_metrics(result_df, predictor_count=3)
@@ -577,11 +581,11 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
 
         formula_text = (
             "Для каждого номера зерна отдельно:\n"
-            "log(cσ / (18 - cσ)) = a_G + b_G·ln(τ) + c_G·(1/T(K))\n"
-            "Температура восстанавливается своей подмоделью для заданного номера зерна."
+            "cσ = A_G · τ^p_G · ((T - 550) / 350)^m_G\n"
+            "Температура для проверки восстанавливается обратным степенным пересчетом."
         )
         summary_text = (
-            "Простая степенная sigma-модель по каждому номеру зерна отдельно.\n\n"
+            "Прямая степенная sigma-модель по каждому номеру зерна отдельно.\n\n"
             + "\n\n".join(summary_parts)
         )
         return FitResult(
@@ -592,15 +596,13 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
             model_summary=summary_text,
             outlier_recommendation=outlier_recommendation,
             formula_text=formula_text,
-            model_label="Степенная sigma-модель по отдельным зернам",
+            model_label="Прямая степенная sigma-модель по отдельным зернам",
         )
 
-    model, pred_logit, pred_sigma = fit_single_grain(df.copy())
-    params_dict = model.params.to_dict()
-    inv_t_pred = (df["sigma_saturation_logit"] - params_dict["const"] - params_dict["ln_tau"] * df["ln_tau"]) / params_dict["inv_T"]
-    temp_pred = 1.0 / inv_t_pred - 273.15
+    params_vec, pred_sigma, temp_pred = fit_single_grain(df.copy())
+    log_a, p_exp, m_exp = params_vec
     result_df = df.copy()
-    result_df["inv_T_pred"] = inv_t_pred
+    result_df["inv_T_pred"] = 1.0 / (temp_pred + 273.15)
     result_df["T_pred"] = temp_pred
     result_df["sigma_pred_pct"] = pred_sigma
     result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
@@ -616,24 +618,26 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
     outlier_recommendation = weak_points[
         (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9)) | (np.abs(weak_points["standard_residual"]) > 2)
     ].copy()
-    conf = model.conf_int()
     params = pd.DataFrame(
         {
-            "Коэффициент": ["a", "b", "c"],
-            "Параметр модели": ["const", "ln_tau", "inv_T"],
-            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get("inv_T", np.nan)],
-            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get("inv_T", np.nan)],
-            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get("inv_T", np.nan)],
-            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get("inv_T", np.nan)],
-            "Нижняя 95% граница": [conf.loc["const", 0], conf.loc["ln_tau", 0], conf.loc["inv_T", 0]],
-            "Верхняя 95% граница": [conf.loc["const", 1], conf.loc["ln_tau", 1], conf.loc["inv_T", 1]],
+            "Коэффициент": ["A", "p", "m"],
+            "Параметр модели": ["log_a", "p_exp", "m_exp"],
+            "Значение": [log_a, p_exp, m_exp],
+            "StdErr": [np.nan, np.nan, np.nan],
+            "t-статистика": [np.nan, np.nan, np.nan],
+            "p-value": [np.nan, np.nan, np.nan],
+            "Нижняя 95% граница": [np.nan, np.nan, np.nan],
+            "Верхняя 95% граница": [np.nan, np.nan, np.nan],
         }
     )
     metrics = build_metrics(result_df, predictor_count=3)
     metrics["RMSE модели сигма-фазы, %"] = float(np.sqrt(mean_squared_error(result_df["c_sigma"], result_df["sigma_pred_pct"])))
     weak_points = result_df.sort_values(by=["abs_error", "standard_residual"], ascending=[False, False]).copy()
-    formula_text = "log(cσ / (18 - cσ)) = a + b·ln(τ) + c·(1/T(K))"
-    summary_text = model.summary().as_text()
+    formula_text = "cσ = A · τ^p · ((T - 550) / 350)^m"
+    summary_text = (
+        "Прямая степенная sigma-модель для одного зерна.\n"
+        f"Параметры: log(A)={log_a:.6f}, p={p_exp:.6f}, m={m_exp:.6f}."
+    )
     return FitResult(
         data=result_df,
         metrics=metrics,
@@ -642,7 +646,7 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         model_summary=summary_text,
         outlier_recommendation=outlier_recommendation,
         formula_text=formula_text,
-        model_label="Степенная sigma-модель для одного зерна",
+        model_label="Прямая степенная sigma-модель для одного зерна",
     )
 
 
@@ -791,6 +795,28 @@ def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
     st.dataframe(result.params, use_container_width=True, hide_index=True)
     st.caption(result.model_label)
     st.code(result.formula_text, language="text")
+
+    if not result.outlier_recommendation.empty:
+        st.warning("Ниже точки, которые система рекомендует проверить или временно исключить из подгонки sigma-модели.")
+        outlier_labels = result.outlier_recommendation["point_id"].astype(str).tolist()
+        selected = st.multiselect(
+            "Исключить точки из sigma-модели",
+            options=result.data["point_id"].astype(str).tolist(),
+            default=outlier_labels,
+            key=f"exclude_sigma_grain_{grain_value}",
+        )
+        if selected:
+            filtered = result.data[~result.data["point_id"].astype(str).isin(selected)].copy()
+            if len(filtered) >= 7:
+                st.info(f"Пересчет sigma-модели после исключения {len(selected)} точек.")
+                recalculated = fit_anchor_saturation_model(filtered, include_grain=False)
+                metric_cards(sigma_metric_summary(recalculated.data))
+                st.dataframe(recalculated.params, use_container_width=True, hide_index=True)
+                st.code(recalculated.formula_text, language="text")
+                result = recalculated
+            else:
+                st.error("После исключения осталось слишком мало точек для устойчивой подгонки sigma-модели.")
+
     st.subheader("Таблица по точкам")
     sigma_view = result.data[["point_id", "T", "tau", "G", "c_sigma", "sigma_pred_pct", "T_pred", "error_celsius"]].copy()
     sigma_view["Ошибка по cσ, %"] = sigma_view["c_sigma"] - sigma_view["sigma_pred_pct"]
@@ -801,7 +827,10 @@ def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
         sigma_vs_temperature_plot(result.data, "Зависимость cσ от температуры")
     with c2:
         sigma_vs_time_plot(result.data, "Зависимость cσ от времени")
-        residual_plot(result.data.assign(error_celsius=result.data["c_sigma"] - result.data["sigma_pred_pct"]), "Остатки по cσ")
+        residual_plot(
+            result.data.assign(T_pred=result.data["sigma_pred_pct"], error_celsius=result.data["c_sigma"] - result.data["sigma_pred_pct"]),
+            "Остатки по cσ",
+        )
     with st.expander("Подробная статистическая сводка"):
         st.text(result.model_summary)
 
@@ -843,8 +872,8 @@ def predict_temperature_improved(params: dict[str, float], D: float, tau: float,
 def predict_temperature_anchor_saturation(
     params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None
 ) -> float:
-    if c_sigma <= 0 or c_sigma >= SIGMA_SATURATION_LIMIT:
-        raise ValueError("Для sigma-модели по зернам содержание сигма-фазы должно быть в диапазоне (0, 18).")
+    if c_sigma <= 0:
+        raise ValueError("Для sigma-модели по зернам содержание сигма-фазы должно быть больше нуля.")
     if G is None:
         raise ValueError("Для модели по отдельным зернам нужно указать номер зерна G.")
 
@@ -856,15 +885,14 @@ def predict_temperature_anchor_saturation(
     if not grain_params:
         raise ValueError(f"Для номера зерна G={G} нет отдельной sigma-модели.")
 
-    inv_coef = grain_params.get("inv_T", np.nan)
-    if not np.isfinite(inv_coef) or abs(inv_coef) < 1e-12:
-        raise ValueError("Коэффициент при 1/T слишком мал для устойчивого расчета.")
-
-    logit_value = sigma_saturation_feature(c_sigma)
-    inv_t = (logit_value - grain_params.get("const", 0.0) - grain_params.get("ln_tau", 0.0) * np.log(tau)) / inv_coef
-    if not np.isfinite(inv_t) or inv_t <= 0:
-        raise ValueError("Модель по отдельному зерну дала неположительное значение 1/T.")
-    return float(1.0 / inv_t - 273.15)
+    log_a = grain_params.get("log_a", np.nan)
+    p_exp = grain_params.get("p_exp", np.nan)
+    m_exp = grain_params.get("m_exp", np.nan)
+    denom = np.exp(log_a) * np.power(max(tau, 1e-12), p_exp)
+    if not np.isfinite(denom) or denom <= 0 or not np.isfinite(m_exp) or abs(m_exp) < 1e-12:
+        raise ValueError("Параметры sigma-модели по зерну некорректны для обратного расчета.")
+    temp_norm = np.power(max(c_sigma / denom, 1e-12), 1.0 / m_exp)
+    return float(np.clip(550.0 + 350.0 * temp_norm, 550.0, 900.0))
 
 
 def show_model_comparison(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
@@ -1270,7 +1298,7 @@ with improved_tab:
 
 with anchor_tab:
     st.write(
-        "Здесь показаны отдельные простые модели содержания сигма-фазы для каждого номера зерна. "
+        "Здесь показаны отдельные прямые степенные модели содержания сигма-фазы для каждого номера зерна, без logit-преобразования. "
         "Для каждого G зависимость строится отдельно по температуре и времени, с собственными коэффициентами, графиками и оценкой качества."
     )
     sigma_grain_scores: list[dict[str, float]] = []
