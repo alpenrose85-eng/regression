@@ -544,20 +544,6 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         | (weak_points["cooks_distance"] > 4 / len(result_df))
     ].copy()
 
-    params_series = pd.Series(params_vector, index=param_names)
-    params = pd.DataFrame(
-        {
-            "Коэффициент": [label for label, _ in coeff_labels],
-            "Параметр модели": [param for _, param in coeff_labels],
-            "Значение": [params_series.get(param, np.nan) for _, param in coeff_labels],
-            "StdErr": [np.nan for _ in coeff_labels],
-            "t-статистика": [np.nan for _ in coeff_labels],
-            "p-value": [np.nan for _ in coeff_labels],
-            "Нижняя 95% граница": [np.nan for _ in coeff_labels],
-            "Верхняя 95% граница": [np.nan for _ in coeff_labels],
-        }
-    )
-
     sigma_conf = sigma_model.conf_int()
     diameter_conf = diameter_model.conf_int()
     sigma_rows = [
