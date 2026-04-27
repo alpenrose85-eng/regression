@@ -193,6 +193,8 @@ def prepare_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     prepared["ln_c_sigma"] = np.log(prepared["c_sigma"])
     sigma_clipped = np.clip(prepared["c_sigma"], 1e-9, SIGMA_SATURATION_LIMIT - 1e-9)
     prepared["sigma_remaining"] = SIGMA_SATURATION_LIMIT - sigma_clipped
+    prepared["sigma_remaining_fraction"] = prepared["sigma_remaining"] / SIGMA_SATURATION_LIMIT
+    prepared["ln_sigma_remaining_fraction"] = np.log(prepared["sigma_remaining_fraction"])
     prepared["sigma_saturation_logit"] = np.log(sigma_clipped / prepared["sigma_remaining"])
 
     return prepared.reset_index(drop=True)
@@ -206,6 +208,16 @@ def sigma_saturation_feature(c_sigma: float, sigma_limit: float = SIGMA_SATURATI
             f"Содержание сигма-фазы должно быть меньше предельного уровня {sigma_limit:.2f}% для насыщаемой модели."
         )
     return float(np.log(c_sigma / (sigma_limit - c_sigma)))
+
+
+def sigma_remaining_feature(c_sigma: float, sigma_limit: float = SIGMA_SATURATION_LIMIT) -> float:
+    if c_sigma <= 0:
+        raise ValueError("Содержание сигма-фазы должно быть больше нуля.")
+    if c_sigma >= sigma_limit:
+        raise ValueError(
+            f"Содержание сигма-фазы должно быть меньше предельного уровня {sigma_limit:.2f}% для кинетической модели."
+        )
+    return float(np.log((sigma_limit - c_sigma) / sigma_limit))
 
 
 def approximation_reliability(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -459,119 +471,88 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
 
-    feature_columns = ["ln_D", "ln_tau", "sigma_saturation_logit"]
-    if include_grain:
-        feature_columns.insert(2, "G")
-
-    X_df = sm.add_constant(df[feature_columns])
-    X = X_df.to_numpy(dtype=float)
+    ln_d = df["ln_D"].to_numpy(dtype=float)
+    ln_tau = df["ln_tau"].to_numpy(dtype=float)
+    ln_sigma_remaining = df["ln_sigma_remaining_fraction"].to_numpy(dtype=float)
+    grain = df["G"].to_numpy(dtype=float) if include_grain else None
     y_true_t = df["T"].to_numpy(dtype=float)
 
-    initial_model = sm.OLS(df["inv_T"], X_df).fit()
-    initial_params = initial_model.params.to_numpy(dtype=float)
-
-    anchor_features = [
-        1.0,
-        np.log(REAL_WORLD_POINT["D"]),
-        np.log(REAL_WORLD_POINT["tau"]),
-    ]
-    if include_grain:
-        anchor_features.append(float(REAL_WORLD_POINT["G"]))
-    anchor_features.append(sigma_saturation_feature(float(REAL_WORLD_POINT["c_sigma"])))
-    anchor_vector = np.array(anchor_features, dtype=float)
-
-    anchor_weight = max(len(df), 10) * 75.0
-    ridge_weight = 1e-6
-
-    def predict_temp(params: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-        inv_t = matrix @ params
+    def kinetic_temperature(params: np.ndarray) -> np.ndarray:
+        a0, b0, n_exp, p_exp, m_exp = params[:5]
+        grain_coeff = params[5] if include_grain else 0.0
+        driving_term = n_exp * ln_d - p_exp * ln_tau + m_exp * ln_sigma_remaining - grain_coeff * (grain if grain is not None else 0.0)
+        inv_t = a0 + b0 * driving_term
         if np.any(inv_t <= 0):
             raise ValueError("Получено неположительное значение 1/T.")
         return 1.0 / inv_t - 273.15
 
-    def objective(params: np.ndarray) -> float:
+    def residuals(params: np.ndarray) -> np.ndarray:
         try:
-            pred_t = predict_temp(params, X)
-            anchor_pred = float(predict_temp(params, anchor_vector.reshape(1, -1))[0])
+            pred_t = kinetic_temperature(params)
+            penalty = 1e-4 * np.sum(np.square(params))
+            return np.append(pred_t - y_true_t, np.sqrt(penalty))
         except ValueError:
-            return 1e12
+            return np.full(len(y_true_t) + 1, 1e6)
 
-        train_loss = float(np.mean(np.square(y_true_t - pred_t)))
-        below = max(0.0, REAL_WORLD_POINT["temp_min"] - anchor_pred)
-        above = max(0.0, anchor_pred - REAL_WORLD_POINT["temp_max"])
-        anchor_penalty = below**2 + above**2
-        ridge_penalty = ridge_weight * float(np.sum(np.square(params)))
-        return train_loss + anchor_weight * anchor_penalty + ridge_penalty
-
-    candidate_starts = [
-        initial_params,
-        initial_params * 0.95,
-        initial_params * 1.05,
-        initial_params + np.array([1e-7] * len(initial_params), dtype=float),
-    ]
-    methods = [
-        ("L-BFGS-B", {"options": {"maxiter": 2000, "ftol": 1e-12, "gtol": 1e-9}}),
-        ("Powell", {"options": {"maxiter": 4000, "xtol": 1e-8, "ftol": 1e-8}}),
-        ("Nelder-Mead", {"options": {"maxiter": 4000, "xatol": 1e-8, "fatol": 1e-8}}),
-    ]
-
-    best_result = None
-    best_method = None
-    best_value = np.inf
-    optimization_messages: list[str] = []
-
-    for start in candidate_starts:
-        for method, kwargs in methods:
-            try:
-                optimization = optimize.minimize(objective, start, method=method, **kwargs)
-                value = float(optimization.fun)
-                optimization_messages.append(
-                    f"{method}: success={optimization.success}, fun={value:.6f}, message={optimization.message}"
-                )
-                if np.isfinite(value) and value < best_value:
-                    best_value = value
-                    best_result = optimization
-                    best_method = method
-                if optimization.success and np.isfinite(value):
-                    best_result = optimization
-                    best_value = value
-                    best_method = method
-                    break
-            except Exception as exc:
-                optimization_messages.append(f"{method}: exception={exc}")
-        if best_result is not None and getattr(best_result, "success", False):
-            break
-
-    if best_result is None or not np.isfinite(best_value):
-        params_vector = initial_params
-        optimization_note = (
-            "Оптимизация якорной модели не дала устойчивого улучшения; использованы стартовые коэффициенты OLS без якорной подстройки."
-        )
+    if include_grain:
+        initial = np.array([1.15e-3, -5e-5, 3.0, 1.0, 1.0, 0.02], dtype=float)
+        lower = np.array([1e-5, -1e-2, 1.0, 0.05, 0.0, -1.0], dtype=float)
+        upper = np.array([1e-2, -1e-8, 8.0, 3.0, 6.0, 1.0], dtype=float)
+        param_names = ["a0", "b0", "n", "p", "m", "g"]
+        coeff_labels = [
+            ("a0", "a0"),
+            ("b0", "b0"),
+            ("n", "n"),
+            ("p", "p"),
+            ("m", "m"),
+            ("g", "g"),
+        ]
     else:
-        params_vector = best_result.x
-        if getattr(best_result, "success", False):
-            optimization_note = f"Оптимизация завершена методом {best_method}: {best_result.message}"
-        else:
-            optimization_note = (
-                "Строгий критерий успеха оптимизатора не выполнен, но выбрано лучшее найденное конечное решение. "
-                f"Лучший метод: {best_method}. Последний статус: {best_result.message}"
+        initial = np.array([1.15e-3, -5e-5, 3.0, 1.0, 1.0], dtype=float)
+        lower = np.array([1e-5, -1e-2, 1.0, 0.05, 0.0], dtype=float)
+        upper = np.array([1e-2, -1e-8, 8.0, 3.0, 6.0], dtype=float)
+        param_names = ["a0", "b0", "n", "p", "m"]
+        coeff_labels = [("a0", "a0"), ("b0", "b0"), ("n", "n"), ("p", "p"), ("m", "m")]
+
+    starts = [
+        initial,
+        initial * np.array([1.0, 1.0, 1.2, 1.0, 0.8] + ([1.0] if include_grain else []), dtype=float),
+        initial * np.array([1.0, 1.0, 0.8, 1.3, 1.2] + ([1.0] if include_grain else []), dtype=float),
+    ]
+
+    best_fit = None
+    best_cost = np.inf
+    fit_messages: list[str] = []
+
+    for start in starts:
+        try:
+            fit = optimize.least_squares(
+                residuals,
+                x0=start,
+                bounds=(lower, upper),
+                method="trf",
+                loss="soft_l1",
+                max_nfev=20000,
             )
+            fit_messages.append(
+                f"success={fit.success}, cost={float(fit.cost):.6f}, nfev={fit.nfev}, message={fit.message}"
+            )
+            if fit.success and float(fit.cost) < best_cost:
+                best_fit = fit
+                best_cost = float(fit.cost)
+            elif best_fit is None and np.isfinite(float(fit.cost)):
+                best_fit = fit
+                best_cost = float(fit.cost)
+        except Exception as exc:
+            fit_messages.append(f"exception={exc}")
 
-    fitted_inv_t = X @ params_vector
-    if np.any(fitted_inv_t <= 0):
-        params_vector = initial_params
-        fitted_inv_t = X @ params_vector
-        optimization_note += (
-            " После оптимизации получались неположительные значения 1/T, поэтому выполнен откат к стартовым коэффициентам OLS."
-        )
-        if np.any(fitted_inv_t <= 0):
-            raise ValueError("Якорная модель дала неположительные значения 1/T даже после отката к стартовым коэффициентам.")
+    if best_fit is None:
+        raise ValueError("Нелинейная подгонка кинетической модели не сошлась ни с одной стартовой точки.")
 
-    fitted_kelvin = 1.0 / fitted_inv_t
-    fitted_c = fitted_kelvin - 273.15
-
-    surrogate_model = sm.OLS(df["inv_T"], X_df).fit()
-    influence = surrogate_model.get_influence()
+    params_vector = best_fit.x
+    fitted_c = kinetic_temperature(params_vector)
+    fitted_kelvin = fitted_c + 273.15
+    fitted_inv_t = 1.0 / fitted_kelvin
 
     result_df = df.copy()
     result_df["inv_T_pred"] = fitted_inv_t
@@ -583,9 +564,13 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         result_df["abs_error"] / np.abs(result_df["T"]) * 100,
         np.nan,
     )
-    result_df["standard_residual"] = influence.resid_studentized_internal
-    result_df["leverage"] = influence.hat_matrix_diag
-    result_df["cooks_distance"] = influence.cooks_distance[0]
+    std_err = result_df["error_celsius"].std(ddof=1)
+    if np.isfinite(std_err) and std_err > 0:
+        result_df["standard_residual"] = (result_df["error_celsius"] - result_df["error_celsius"].mean()) / std_err
+    else:
+        result_df["standard_residual"] = 0.0
+    result_df["leverage"] = np.nan
+    result_df["cooks_distance"] = np.nan
 
     weak_points = result_df.sort_values(
         by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
@@ -597,57 +582,39 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         | (weak_points["cooks_distance"] > 4 / len(result_df))
     ].copy()
 
-    param_names = ["const", "ln_D", "ln_tau"]
-    coeff_labels = [("a", "const"), ("b", "ln_D"), ("c", "ln_tau")]
-    if include_grain:
-        param_names.append("G")
-        coeff_labels.append(("d", "G"))
-    param_names.append("sigma_saturation_logit")
-    coeff_labels.append(("e", "sigma_saturation_logit"))
-
     params_series = pd.Series(params_vector, index=param_names)
-    conf_int = surrogate_model.conf_int()
     params = pd.DataFrame(
         {
             "Коэффициент": [label for label, _ in coeff_labels],
             "Параметр модели": [param for _, param in coeff_labels],
             "Значение": [params_series.get(param, np.nan) for _, param in coeff_labels],
-            "StdErr": [surrogate_model.bse.get(param, np.nan) for _, param in coeff_labels],
-            "t-статистика": [surrogate_model.tvalues.get(param, np.nan) for _, param in coeff_labels],
-            "p-value": [surrogate_model.pvalues.get(param, np.nan) for _, param in coeff_labels],
-            "Нижняя 95% граница": [conf_int.loc[param, 0] for _, param in coeff_labels],
-            "Верхняя 95% граница": [conf_int.loc[param, 1] for _, param in coeff_labels],
+            "StdErr": [np.nan for _ in coeff_labels],
+            "t-статистика": [np.nan for _ in coeff_labels],
+            "p-value": [np.nan for _ in coeff_labels],
+            "Нижняя 95% граница": [np.nan for _ in coeff_labels],
+            "Верхняя 95% граница": [np.nan for _ in coeff_labels],
         }
     )
 
-    metrics = build_metrics(result_df, predictor_count=len(feature_columns))
-    anchor_pred = float(1.0 / np.dot(anchor_vector, params_vector) - 273.15)
-    metrics["Прогноз для реальной точки, °C"] = anchor_pred
-    if REAL_WORLD_POINT["temp_min"] <= anchor_pred <= REAL_WORLD_POINT["temp_max"]:
-        metrics["Отклонение реальной точки от диапазона, °C"] = 0.0
-    elif anchor_pred < REAL_WORLD_POINT["temp_min"]:
-        metrics["Отклонение реальной точки от диапазона, °C"] = REAL_WORLD_POINT["temp_min"] - anchor_pred
-    else:
-        metrics["Отклонение реальной точки от диапазона, °C"] = anchor_pred - REAL_WORLD_POINT["temp_max"]
+    metrics = build_metrics(result_df, predictor_count=len(param_names))
 
     formula_text = (
-        "1 / T(K) = "
-        f"{params_series.get('const', np.nan):.8f} "
-        f"+ ({params_series.get('ln_D', np.nan):.8f})·ln(D) "
-        f"+ ({params_series.get('ln_tau', np.nan):.8f})·ln(τ) "
+        "1 / T(K) = a0 + b0·[n·ln(D) - p·ln(τ) + m·ln((18-cσ)/18)"
     )
     if include_grain:
-        formula_text += f"+ ({params_series.get('G', np.nan):.8f})·G "
-    formula_text += (
-        f"+ ({params_series.get('sigma_saturation_logit', np.nan):.8f})·ln(cσ / ({SIGMA_SATURATION_LIMIT:.2f} - cσ))"
-    )
+        formula_text += " - g·G]"
+    else:
+        formula_text += "]"
 
-    summary_text = surrogate_model.summary().as_text() + (
-        "\n\nЯкорная настройка: модель дополнительно штрафуется, если прогноз для реальной точки "
-        f"(τ={REAL_WORLD_POINT['tau']:.0f} ч, D={REAL_WORLD_POINT['D']}, cσ={REAL_WORLD_POINT['c_sigma']}, G={REAL_WORLD_POINT['G']:.0f}) "
-        f"выходит за диапазон {REAL_WORLD_POINT['temp_min']:.0f}–{REAL_WORLD_POINT['temp_max']:.0f} °C."
-        f"\n\nСтатус оптимизации: {optimization_note}"
-        f"\n\nЖурнал попыток: {' | '.join(optimization_messages[:12])}"
+    summary_text = (
+        "Нелинейная физико-математическая модель роста вторичных фаз.\n\n"
+        "Предполагается кинетика укрупнения вида D^n ~ tau^p · exp(-Q/RT), а приближение к предельному "
+        f"содержанию сигма-фазы {SIGMA_SATURATION_LIMIT:.2f}% замедляет процесс через множитель ln((18-cσ)/18).\n\n"
+        "Подгоняются параметры: a0, b0, n, p, m"
+        + (", g" if include_grain else "")
+        + ".\n\n"
+        + f"Лучшее решение least_squares: success={best_fit.success}, cost={float(best_fit.cost):.6f}, message={best_fit.message}.\n"
+        + f"Журнал стартов: {' | '.join(fit_messages[:10])}"
     )
 
     return FitResult(
@@ -658,7 +625,7 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         model_summary=summary_text,
         outlier_recommendation=outlier_recommendation,
         formula_text=formula_text,
-        model_label="Якорно-кинетическая модель с насыщением сигма-фазы",
+        model_label="Кинетическая модель роста частиц с торможением по сигма-фазе",
     )
 
 
@@ -778,16 +745,16 @@ def predict_temperature_improved(params: dict[str, float], D: float, tau: float,
 def predict_temperature_anchor_saturation(
     params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None
 ) -> float:
-    inv_t = (
-        params.get("const", 0.0)
-        + params.get("ln_D", 0.0) * np.log(D)
-        + params.get("ln_tau", 0.0) * np.log(tau)
-        + params.get("sigma_saturation_logit", 0.0) * sigma_saturation_feature(c_sigma)
+    driving_term = (
+        params.get("n", 0.0) * np.log(D)
+        - params.get("p", 0.0) * np.log(tau)
+        + params.get("m", 0.0) * sigma_remaining_feature(c_sigma)
     )
-    if G is not None and "G" in params:
-        inv_t += params.get("G", 0.0) * G
+    if G is not None and "g" in params:
+        driving_term -= params.get("g", 0.0) * G
+    inv_t = params.get("a0", 0.0) + params.get("b0", 0.0) * driving_term
     if inv_t <= 0:
-        raise ValueError("Якорно-кинетическая модель дала неположительное значение 1/T. Проверьте введенные параметры.")
+        raise ValueError("Кинетическая модель дала неположительное значение 1/T. Проверьте введенные параметры.")
     return 1.0 / inv_t - 273.15
 
 
@@ -811,7 +778,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
             "Метрика": metric_order,
             "Базовая модель": [base_result.metrics.get(metric, np.nan) for metric in metric_order],
             "Улучшенная модель": [improved_result.metrics.get(metric, np.nan) for metric in metric_order],
-            "Якорно-кинетическая модель": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
+            "Кинетическая модель роста частиц": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
         }
     )
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
@@ -833,7 +800,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
                 ),
             },
             {
-                "Модель": "Якорно-кинетическая",
+                "Модель": "Кинетическая модель роста частиц",
                 "Прогноз для реальной точки, °C": anchor_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
                 "Отклонение от диапазона 570–600 °C, °C": anchor_result.metrics.get(
                     "Отклонение реальной точки от диапазона, °C", np.nan
@@ -874,13 +841,13 @@ def show_multi_calculator(base_result: FitResult, improved_result: FitResult, an
         with r2:
             st.metric("Температура по улучшенной модели, °C", f"{improved_temp:.4f}")
         with r3:
-            st.metric("Температура по якорно-кинетической модели, °C", f"{anchor_temp:.4f}")
+            st.metric("Температура по кинетической модели, °C", f"{anchor_temp:.4f}")
 
         calc_df = pd.DataFrame(
             [
                 {"Модель": "Базовая", "Расчетная температура, °C": base_temp},
                 {"Модель": "Улучшенная", "Расчетная температура, °C": improved_temp},
-                {"Модель": "Якорно-кинетическая", "Расчетная температура, °C": anchor_temp},
+                {"Модель": "Кинетическая модель роста частиц", "Расчетная температура, °C": anchor_temp},
             ]
         )
         st.dataframe(calc_df, use_container_width=True, hide_index=True)
@@ -1052,7 +1019,7 @@ main_tab, grain_tab, improved_tab, anchor_tab, compare_tab, calculator_tab = st.
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
-    "Якорно-кинетическая модель",
+    "Кинетическая модель роста частиц",
     "Сравнение моделей",
     "Калькулятор",
 ])
@@ -1192,9 +1159,9 @@ with improved_tab:
 
 with anchor_tab:
     st.write(
-        "Новая модель учитывает два важных замечания: рост сигма-фазы замедляется при приближении к пределу 18%, "
-        "а очень важная реальная точка с τ=150000 ч используется как якорное ограничение по диапазону 570–600 °C. "
-        "Форма модели: 1/T = a + b·ln(D) + c·ln(τ) + d·G + e·ln(cσ/(18-cσ))."
+        "Новая модель исходит из кинетики укрупнения вторичных фаз: D^n ~ τ^p · exp(-Q/RT), "
+        "а приближение сигма-фазы к пределу 18% замедляет процесс через остаточный ресурс по фазообразованию. "
+        "Модель использует форму 1/T = a0 + b0·[n·ln(D) - p·ln(τ) + m·ln((18-cσ)/18) - g·G]."
     )
     try:
         if anchor_result is None:
@@ -1211,7 +1178,7 @@ with anchor_tab:
             f"{anchor_result.metrics.get('Прогноз для реальной точки, °C', np.nan):.4f} °C."
         )
     except Exception as exc:
-        st.error(f"Не удалось построить якорно-кинетическую модель: {exc}")
+        st.error(f"Не удалось построить кинетическую модель роста частиц: {exc}")
 
 with compare_tab:
     if base_result is None:
@@ -1219,7 +1186,7 @@ with compare_tab:
     elif improved_result is None:
         st.error(f"Улучшенная модель недоступна для сравнения: {improved_error}")
     elif anchor_result is None:
-        st.error(f"Якорно-кинетическая модель недоступна для сравнения: {anchor_error}")
+        st.error(f"Кинетическая модель роста частиц недоступна для сравнения: {anchor_error}")
     else:
         show_model_comparison(base_result, improved_result, anchor_result)
 
@@ -1235,13 +1202,13 @@ with compare_tab:
                         "Номер зерна": grain,
                         "R² базовая": base_grain_result.metrics["R²"],
                         "R² улучшенная": improved_grain_result.metrics["R²"],
-                        "R² якорно-кинетическая": anchor_grain_result.metrics["R²"],
+                        "R² кинетическая": anchor_grain_result.metrics["R²"],
                         "RMSE базовая, °C": base_grain_result.metrics["RMSE, °C"],
                         "RMSE улучшенная, °C": improved_grain_result.metrics["RMSE, °C"],
-                        "RMSE якорно-кинетическая, °C": anchor_grain_result.metrics["RMSE, °C"],
+                        "RMSE кинетическая, °C": anchor_grain_result.metrics["RMSE, °C"],
                         "MAPE базовая, %": base_grain_result.metrics["MAPE, %"],
                         "MAPE улучшенная, %": improved_grain_result.metrics["MAPE, %"],
-                        "MAPE якорно-кинетическая, %": anchor_grain_result.metrics["MAPE, %"],
+                        "MAPE кинетическая, %": anchor_grain_result.metrics["MAPE, %"],
                     }
                 )
             except Exception:
@@ -1258,6 +1225,6 @@ with calculator_tab:
     elif improved_result is None:
         st.error(f"Калькулятор улучшенной модели недоступен: {improved_error}")
     elif anchor_result is None:
-        st.error(f"Калькулятор якорно-кинетической модели недоступен: {anchor_error}")
+        st.error(f"Калькулятор кинетической модели недоступен: {anchor_error}")
     else:
         show_multi_calculator(base_result, improved_result, anchor_result)
