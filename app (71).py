@@ -1112,6 +1112,20 @@ def build_cleaned_diameter_grain_results(prepared_df: pd.DataFrame, valid_grains
     return cleaned_results
 
 
+def get_recommended_diameter_exclusions(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, list[str]]:
+    recommendations: dict[float, list[str]] = {}
+    for grain in valid_grains:
+        grain_df = prepared_df[prepared_df["G"] == grain].copy()
+        if len(grain_df) < 7:
+            continue
+        try:
+            result = fit_diameter_growth_model(grain_df, include_grain=False)
+        except Exception:
+            continue
+        recommendations[grain] = result.outlier_recommendation["point_id"].astype(str).tolist()
+    return recommendations
+
+
 def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResult]) -> tuple[dict[str, float], pd.DataFrame, str]:
     rows: list[dict[str, float]] = []
     for grain, result in cleaned_results.items():
@@ -1688,72 +1702,98 @@ with diameter_tab:
     if not valid_grains:
         st.warning("Для отдельных номеров зерна пока недостаточно точек. Нужно минимум 7 точек на номер зерна.")
     else:
-        cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
-        selected_diameter_grain = st.selectbox("Выберите номер зерна для модели диаметра", valid_grains)
-        for grain in valid_grains:
-            grain_df = prepared_df[prepared_df["G"] == grain].copy()
-            try:
-                grain_result = cleaned_diameter_results.get(grain) or fit_diameter_growth_model(grain_df, include_grain=False)
-                diameter_grain_scores.append(
+        local_tab, universal_tab = st.tabs(["Модели по отдельным зернам", "Универсальная модель"])
+        with local_tab:
+            cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
+            selected_diameter_grain = st.selectbox("Выберите номер зерна для модели диаметра", valid_grains)
+            for grain in valid_grains:
+                grain_df = prepared_df[prepared_df["G"] == grain].copy()
+                try:
+                    grain_result = cleaned_diameter_results.get(grain) or fit_diameter_growth_model(grain_df, include_grain=False)
+                    diameter_grain_scores.append(
+                        {
+                            "Номер зерна": grain,
+                            "Количество точек": grain_result.metrics["Количество точек"],
+                            "R²": grain_result.metrics["R²"],
+                            "RMSE, °C": grain_result.metrics["RMSE, °C"],
+                            "MAE, °C": grain_result.metrics["MAE, °C"],
+                            "MAPE, %": grain_result.metrics["MAPE, %"],
+                        }
+                    )
+                    if grain == selected_diameter_grain:
+                        show_diameter_grain_block(grain_result, grain)
+                except Exception:
+                    continue
+
+            if diameter_grain_scores:
+                st.subheader("Сравнение моделей роста диаметра по номерам зерна")
+                diameter_score_df = pd.DataFrame(diameter_grain_scores).sort_values(
+                    by=["R²", "RMSE, °C", "MAPE, %"],
+                    ascending=[False, True, True],
+                )
+                st.dataframe(diameter_score_df, use_container_width=True, hide_index=True)
+                best_diameter_grain = diameter_score_df.iloc[0]
+                st.info(
+                    f"Лучше всего модель роста диаметра сейчас выглядит для номера зерна {best_diameter_grain['Номер зерна']}: "
+                    f"R²={best_diameter_grain['R²']:.4f}, RMSE={best_diameter_grain['RMSE, °C']:.4f} °C."
+                )
+
+        with universal_tab:
+            recommended_exclusions = get_recommended_diameter_exclusions(prepared_df, valid_grains)
+            c_apply_all, c_reset_all = st.columns(2)
+            with c_apply_all:
+                if st.button("Применить все рекомендованные исключения по всем зернам", key="apply_all_diameter_exclusions"):
+                    for grain, labels in recommended_exclusions.items():
+                        st.session_state[f"applied_exclude_diameter_grain_{grain}"] = list(labels)
+            with c_reset_all:
+                if st.button("Сбросить все исключения по росту диаметра", key="reset_all_diameter_exclusions"):
+                    for grain in valid_grains:
+                        st.session_state[f"applied_exclude_diameter_grain_{grain}"] = []
+
+            active_rows = []
+            for grain in valid_grains:
+                active_rows.append(
                     {
                         "Номер зерна": grain,
-                        "Количество точек": grain_result.metrics["Количество точек"],
-                        "R²": grain_result.metrics["R²"],
-                        "RMSE, °C": grain_result.metrics["RMSE, °C"],
-                        "MAE, °C": grain_result.metrics["MAE, °C"],
-                        "MAPE, %": grain_result.metrics["MAPE, %"],
+                        "Рекомендовано исключить": len(recommended_exclusions.get(grain, [])),
+                        "Сейчас исключено": len(st.session_state.get(f"applied_exclude_diameter_grain_{grain}", [])),
                     }
                 )
-                if grain == selected_diameter_grain:
-                    show_diameter_grain_block(grain_result, grain)
-            except Exception:
-                continue
+            st.dataframe(pd.DataFrame(active_rows), use_container_width=True, hide_index=True)
 
-        if diameter_grain_scores:
-            st.subheader("Сравнение моделей роста диаметра по номерам зерна")
-            diameter_score_df = pd.DataFrame(diameter_grain_scores).sort_values(
-                by=["R²", "RMSE, °C", "MAPE, %"],
-                ascending=[False, True, True],
-            )
-            st.dataframe(diameter_score_df, use_container_width=True, hide_index=True)
-            best_diameter_grain = diameter_score_df.iloc[0]
-            st.info(
-                f"Лучше всего модель роста диаметра сейчас выглядит для номера зерна {best_diameter_grain['Номер зерна']}: "
-                f"R²={best_diameter_grain['R²']:.4f}, RMSE={best_diameter_grain['RMSE, °C']:.4f} °C."
-            )
-
-        st.subheader("Универсальная модель по размеру зерна")
-        try:
-            universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
-            formula_text = (
-                "ln(D) = a(dg) + b·ln(τ) + c(dg)·(1/T(K))\n"
-                "a(dg) = alpha0 + alpha1·ln(dg)\n"
-                "b = const\n"
-                "c(dg) = gamma0 + gamma1·ln(dg)\n"
-                f"alpha0 = {universal_params['alpha0']:.8f}, alpha1 = {universal_params['alpha1']:.8f}\n"
-                f"b = {universal_params['b_const']:.8f}\n"
-                f"gamma0 = {universal_params['gamma0']:.8f}, gamma1 = {universal_params['gamma1']:.8f}"
-            )
-            st.code(formula_text, language="text")
-            st.dataframe(coeff_df, use_container_width=True, hide_index=True)
-            with st.expander("Сводка по универсальной модели"):
-                st.text(universal_summary)
-
-            st.subheader("Калькулятор температуры по универсальной модели")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                tau_value = st.number_input("Время наработки τ для универсальной модели", min_value=1e-9, value=1000.0, step=100.0, format="%.6f", key="diameter_universal_tau")
-            with c2:
-                d_value = st.number_input("Эквивалентный диаметр D для универсальной модели", min_value=1e-9, value=10.0, step=0.1, format="%.6f", key="diameter_universal_D")
-            with c3:
-                grain_number = st.selectbox("Номер зерна для универсальной модели", sorted(GRAIN_SIZE_MM.keys()), key="diameter_universal_grain")
+            cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
+            st.subheader("Универсальная модель по размеру зерна")
             try:
-                temp_value = predict_temperature_diameter_universal(universal_params, d_value, tau_value, GRAIN_SIZE_MM[float(grain_number)])
-                st.metric("Расчетная температура по универсальной модели, °C", f"{temp_value:.4f}")
+                universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
+                formula_text = (
+                    "ln(D) = a(dg) + b·ln(τ) + c(dg)·(1/T(K))\n"
+                    "a(dg) = alpha0 + alpha1·ln(dg)\n"
+                    "b = const\n"
+                    "c(dg) = gamma0 + gamma1·ln(dg)\n"
+                    f"alpha0 = {universal_params['alpha0']:.8f}, alpha1 = {universal_params['alpha1']:.8f}\n"
+                    f"b = {universal_params['b_const']:.8f}\n"
+                    f"gamma0 = {universal_params['gamma0']:.8f}, gamma1 = {universal_params['gamma1']:.8f}"
+                )
+                st.code(formula_text, language="text")
+                st.dataframe(coeff_df, use_container_width=True, hide_index=True)
+                with st.expander("Сводка по универсальной модели"):
+                    st.text(universal_summary)
+
+                st.subheader("Калькулятор температуры по универсальной модели")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    tau_value = st.number_input("Время наработки τ для универсальной модели", min_value=1e-9, value=1000.0, step=100.0, format="%.6f", key="diameter_universal_tau")
+                with c2:
+                    d_value = st.number_input("Эквивалентный диаметр D для универсальной модели", min_value=1e-9, value=10.0, step=0.1, format="%.6f", key="diameter_universal_D")
+                with c3:
+                    grain_number = st.selectbox("Номер зерна для универсальной модели", sorted(GRAIN_SIZE_MM.keys()), key="diameter_universal_grain")
+                try:
+                    temp_value = predict_temperature_diameter_universal(universal_params, d_value, tau_value, GRAIN_SIZE_MM[float(grain_number)])
+                    st.metric("Расчетная температура по универсальной модели, °C", f"{temp_value:.4f}")
+                except Exception as exc:
+                    st.error(f"Не удалось выполнить расчет по универсальной модели: {exc}")
             except Exception as exc:
-                st.error(f"Не удалось выполнить расчет по универсальной модели: {exc}")
-        except Exception as exc:
-            st.error(f"Не удалось собрать универсальную модель по размеру зерна: {exc}")
+                st.error(f"Не удалось собрать универсальную модель по размеру зерна: {exc}")
 
 with anchor_tab:
     st.write(
