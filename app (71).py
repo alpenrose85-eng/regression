@@ -817,6 +817,33 @@ def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
     st.caption(result.model_label)
     st.code(result.formula_text, language="text")
 
+    st.subheader("Калькулятор температуры для этого номера зерна")
+    calc_params = result.params.set_index("Параметр модели")["Значение"].to_dict()
+    c1, c2 = st.columns(2)
+    with c1:
+        tau_value = st.number_input(
+            f"Время наработки τ для зерна {grain_value}",
+            min_value=1e-9,
+            value=1000.0,
+            step=100.0,
+            format="%.6f",
+            key=f"sigma_grain_tau_{grain_value}",
+        )
+    with c2:
+        sigma_value = st.number_input(
+            f"Содержание сигма-фазы cσ для зерна {grain_value}, %",
+            min_value=1e-9,
+            value=1.0,
+            step=0.1,
+            format="%.6f",
+            key=f"sigma_grain_sigma_{grain_value}",
+        )
+    try:
+        calc_temp = predict_temperature_anchor_saturation(calc_params, 1.0, tau_value, sigma_value, grain_value)
+        st.metric("Расчетная температура, °C", f"{calc_temp:.4f}")
+    except Exception as exc:
+        st.error(f"Не удалось выполнить расчет температуры для этого зерна: {exc}")
+
     if not result.outlier_recommendation.empty:
         st.warning("Ниже точки, которые система рекомендует проверить или временно исключить из подгонки sigma-модели.")
         outlier_labels = result.outlier_recommendation["point_id"].astype(str).tolist()
