@@ -471,6 +471,77 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
 
+    if include_grain:
+        result_frames: list[pd.DataFrame] = []
+        param_rows: list[dict[str, float | str]] = []
+        summary_parts: list[str] = []
+
+        for grain_value in sorted(df["G"].dropna().unique().tolist()):
+            grain_df = df[df["G"] == grain_value].copy()
+            if len(grain_df) < 7:
+                summary_parts.append(f"Зерно {grain_value}: пропущено, точек меньше 7.")
+                continue
+            grain_result = fit_diameter_growth_model(grain_df, include_grain=False)
+            result_frames.append(grain_result.data)
+            summary_parts.append(f"--- Модель роста диаметра для зерна {grain_value} ---\n{grain_result.model_summary}")
+            for _, row in grain_result.params.iterrows():
+                param_rows.append(
+                    {
+                        "Коэффициент": f"{row['Коэффициент']}(G={grain_value})",
+                        "Параметр модели": f"grain_{grain_value}_{row['Параметр модели']}",
+                        "Значение": row["Значение"],
+                        "StdErr": row["StdErr"],
+                        "t-статистика": row["t-статистика"],
+                        "p-value": row["p-value"],
+                        "Нижняя 95% граница": row["Нижняя 95% граница"],
+                        "Верхняя 95% граница": row["Верхняя 95% граница"],
+                    }
+                )
+
+        if not result_frames:
+            raise ValueError("Не удалось построить ни одной модели роста диаметра по отдельным зернам: недостаточно данных.")
+
+        result_df = pd.concat(result_frames, ignore_index=True)
+        params = pd.DataFrame(param_rows)
+        metrics = build_metrics(result_df, predictor_count=2)
+
+        real_grain = REAL_WORLD_POINT["G"]
+        matching = params[params["Параметр модели"].str.startswith(f"grain_{real_grain}_")]
+        if matching.empty:
+            metrics["Прогноз для реальной точки, °C"] = np.nan
+            metrics["Отклонение реальной точки от диапазона, °C"] = np.nan
+        else:
+            grain_params = {
+                row["Параметр модели"].split(f"grain_{real_grain}_", 1)[1]: row["Значение"]
+                for _, row in matching.iterrows()
+            }
+            real_temp = predict_temperature_diameter_growth(grain_params, REAL_WORLD_POINT["D"], REAL_WORLD_POINT["tau"])
+            metrics["Прогноз для реальной точки, °C"] = float(real_temp)
+            if REAL_WORLD_POINT["temp_min"] <= real_temp <= REAL_WORLD_POINT["temp_max"]:
+                metrics["Отклонение реальной точки от диапазона, °C"] = 0.0
+            elif real_temp < REAL_WORLD_POINT["temp_min"]:
+                metrics["Отклонение реальной точки от диапазона, °C"] = REAL_WORLD_POINT["temp_min"] - real_temp
+            else:
+                metrics["Отклонение реальной точки от диапазона, °C"] = real_temp - REAL_WORLD_POINT["temp_max"]
+
+        weak_points = result_df.sort_values(
+            by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
+        ).copy()
+        outlier_recommendation = weak_points[
+            (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
+            | (np.abs(weak_points["standard_residual"]) > 2)
+        ].copy()
+        return FitResult(
+            data=result_df,
+            metrics=metrics,
+            params=params,
+            weak_points=weak_points,
+            model_summary="Модели роста диаметра по отдельным зернам.\n\n" + "\n\n".join(summary_parts),
+            outlier_recommendation=outlier_recommendation,
+            formula_text="Для каждого номера зерна отдельно: ln(D)=a_G+b_G·ln(τ)+c_G·(1/T(K))",
+            model_label="Эмпирические модели роста диаметра по отдельным зернам",
+        )
+
     feature_columns = ["ln_tau", "inv_T"]
     X = sm.add_constant(df[feature_columns])
     y = df["ln_D"]
@@ -1007,6 +1078,44 @@ def predict_temperature_diameter_growth(params: dict[str, float], D: float, tau:
     return 1.0 / inv_t - 273.15
 
 
+def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
+    st.subheader(f"Модель роста диаметра для номера зерна {grain_value}")
+    metric_cards(result.metrics)
+    st.subheader("Коэффициенты модели")
+    st.dataframe(result.params, use_container_width=True, hide_index=True)
+    st.caption(result.model_label)
+    st.code(result.formula_text, language="text")
+
+    st.subheader("Калькулятор температуры для этого номера зерна")
+    calc_params = result.params.set_index("Параметр модели")["Значение"].to_dict()
+    c1, c2 = st.columns(2)
+    with c1:
+        tau_value = st.number_input(
+            f"Время наработки τ для модели диаметра, зерно {grain_value}",
+            min_value=1e-9,
+            value=1000.0,
+            step=100.0,
+            format="%.6f",
+            key=f"diameter_tau_{grain_value}",
+        )
+    with c2:
+        d_value = st.number_input(
+            f"Эквивалентный диаметр D для зерна {grain_value}",
+            min_value=1e-9,
+            value=10.0,
+            step=0.1,
+            format="%.6f",
+            key=f"diameter_D_{grain_value}",
+        )
+    try:
+        temp_value = predict_temperature_diameter_growth(calc_params, d_value, tau_value)
+        st.metric("Расчетная температура по модели диаметра, °C", f"{temp_value:.4f}")
+    except Exception as exc:
+        st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
+
+    show_result_block(result, key_prefix=f"diameter_grain_{grain_value}", include_grain=False, fit_function=fit_diameter_growth_model)
+
+
 def predict_temperature_anchor_saturation(
     params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None
 ) -> float:
@@ -1262,7 +1371,7 @@ except Exception as exc:
 diameter_result = None
 diameter_error = None
 try:
-    diameter_result = fit_diameter_growth_model(prepared_df)
+    diameter_result = fit_diameter_growth_model(prepared_df, include_grain=True)
 except Exception as exc:
     diameter_error = str(exc)
 
@@ -1449,32 +1558,45 @@ with improved_tab:
 
 with diameter_tab:
     st.write(
-        "Первый шаг для модели укрупнения: эмпирическая зависимость ln(D) = a + b·ln(τ) + c·(1/T). "
-        "Она соответствует инженерной форме coarsening-модели и позволяет проверить, насколько один только диаметр предсказывает температуру."
+        "Модель роста диаметра тоже строится отдельно для каждого номера зерна. "
+        "Для каждого G используется своя зависимость ln(D) = a + b·ln(τ) + c·(1/T), потому что скорость укрупнения сильно зависит от зерна."
     )
-    try:
-        if diameter_result is None:
-            raise ValueError(diameter_error or "неизвестная ошибка")
-        show_result_block(
-            diameter_result,
-            key_prefix="diameter_growth",
-            include_grain=False,
-            fit_function=fit_diameter_growth_model,
-        )
-        st.subheader("Калькулятор температуры по модели роста диаметра")
-        p = diameter_result.params.set_index("Параметр модели")["Значение"].to_dict()
-        c1, c2 = st.columns(2)
-        with c1:
-            tau_value = st.number_input("Время наработки τ для модели диаметра", min_value=1e-9, value=1000.0, step=100.0, format="%.6f")
-        with c2:
-            d_value = st.number_input("Эквивалентный диаметр D для модели диаметра", min_value=1e-9, value=10.0, step=0.1, format="%.6f")
-        try:
-            temp_value = predict_temperature_diameter_growth(p, d_value, tau_value)
-            st.metric("Расчетная температура по модели диаметра, °C", f"{temp_value:.4f}")
-        except Exception as exc:
-            st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
-    except Exception as exc:
-        st.error(f"Не удалось построить модель роста диаметра: {exc}")
+    diameter_grain_scores: list[dict[str, float]] = []
+    if not valid_grains:
+        st.warning("Для отдельных номеров зерна пока недостаточно точек. Нужно минимум 7 точек на номер зерна.")
+    else:
+        selected_diameter_grain = st.selectbox("Выберите номер зерна для модели диаметра", valid_grains)
+        for grain in valid_grains:
+            grain_df = prepared_df[prepared_df["G"] == grain].copy()
+            try:
+                grain_result = fit_diameter_growth_model(grain_df, include_grain=False)
+                diameter_grain_scores.append(
+                    {
+                        "Номер зерна": grain,
+                        "Количество точек": grain_result.metrics["Количество точек"],
+                        "R²": grain_result.metrics["R²"],
+                        "RMSE, °C": grain_result.metrics["RMSE, °C"],
+                        "MAE, °C": grain_result.metrics["MAE, °C"],
+                        "MAPE, %": grain_result.metrics["MAPE, %"],
+                    }
+                )
+                if grain == selected_diameter_grain:
+                    show_diameter_grain_block(grain_result, grain)
+            except Exception:
+                continue
+
+        if diameter_grain_scores:
+            st.subheader("Сравнение моделей роста диаметра по номерам зерна")
+            diameter_score_df = pd.DataFrame(diameter_grain_scores).sort_values(
+                by=["R²", "RMSE, °C", "MAPE, %"],
+                ascending=[False, True, True],
+            )
+            st.dataframe(diameter_score_df, use_container_width=True, hide_index=True)
+            best_diameter_grain = diameter_score_df.iloc[0]
+            st.info(
+                f"Лучше всего модель роста диаметра сейчас выглядит для номера зерна {best_diameter_grain['Номер зерна']}: "
+                f"R²={best_diameter_grain['R²']:.4f}, RMSE={best_diameter_grain['RMSE, °C']:.4f} °C."
+            )
 
 with anchor_tab:
     st.write(
