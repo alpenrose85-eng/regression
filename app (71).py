@@ -467,6 +467,83 @@ def fit_improved_model(df: pd.DataFrame, include_grain: bool = True) -> FitResul
     )
 
 
+def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> FitResult:
+    if len(df) < 7:
+        raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
+
+    feature_columns = ["ln_tau", "inv_T"]
+    X = sm.add_constant(df[feature_columns])
+    y = df["ln_D"]
+
+    model = sm.OLS(y, X).fit()
+    influence = model.get_influence()
+
+    a2 = model.params.get("inv_T", np.nan)
+    if not np.isfinite(a2) or abs(a2) < 1e-12:
+        raise ValueError("Коэффициент при 1/T в модели роста диаметра слишком мал для устойчивого обратного расчета.")
+
+    numerator = df["ln_D"] - model.params.get("const", 0.0) - model.params.get("ln_tau", 0.0) * df["ln_tau"]
+    inv_t_pred = numerator / a2
+    if np.any(inv_t_pred <= 0):
+        raise ValueError("Модель роста диаметра дала неположительное значение 1/T для части точек.")
+
+    temp_kelvin_pred = 1.0 / inv_t_pred
+    temp_c_pred = temp_kelvin_pred - 273.15
+
+    result_df = df.copy()
+    result_df["inv_T_pred"] = inv_t_pred
+    result_df["T_pred"] = temp_c_pred
+    result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
+    result_df["abs_error"] = np.abs(result_df["error_celsius"])
+    result_df["rel_error_pct"] = np.where(result_df["T"] != 0, result_df["abs_error"] / np.abs(result_df["T"]) * 100, np.nan)
+    result_df["standard_residual"] = influence.resid_studentized_internal
+    result_df["leverage"] = influence.hat_matrix_diag
+    result_df["cooks_distance"] = influence.cooks_distance[0]
+
+    weak_points = result_df.sort_values(
+        by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
+    ).copy()
+    outlier_recommendation = weak_points[
+        (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
+        | (np.abs(weak_points["standard_residual"]) > 2)
+        | (weak_points["cooks_distance"] > 4 / len(result_df))
+    ].copy()
+
+    conf_int = model.conf_int()
+    params = pd.DataFrame(
+        {
+            "Коэффициент": ["a", "b", "c"],
+            "Параметр модели": ["const", "ln_tau", "inv_T"],
+            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get("inv_T", np.nan)],
+            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get("inv_T", np.nan)],
+            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get("inv_T", np.nan)],
+            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get("inv_T", np.nan)],
+            "Нижняя 95% граница": [conf_int.loc["const", 0], conf_int.loc["ln_tau", 0], conf_int.loc["inv_T", 0]],
+            "Верхняя 95% граница": [conf_int.loc["const", 1], conf_int.loc["ln_tau", 1], conf_int.loc["inv_T", 1]],
+        }
+    )
+
+    metrics = build_metrics(result_df, predictor_count=len(feature_columns))
+    formula_text = (
+        "ln(D) = a + b·ln(τ) + c·(1/T(K))\n"
+        f"a = {model.params.get('const', np.nan):.8f}\n"
+        f"b = {model.params.get('ln_tau', np.nan):.8f}\n"
+        f"c = {model.params.get('inv_T', np.nan):.8f}\n"
+        f"Итог: ln(D) = {model.params.get('const', np.nan):.8f} + ({model.params.get('ln_tau', np.nan):.8f})·ln(τ) + ({model.params.get('inv_T', np.nan):.8f})·(1/T(K))"
+    )
+
+    return FitResult(
+        data=result_df,
+        metrics=metrics,
+        params=params,
+        weak_points=weak_points,
+        model_summary=model.summary().as_text(),
+        outlier_recommendation=outlier_recommendation,
+        formula_text=formula_text,
+        model_label="Эмпирическая модель роста диаметра ln(D)=a+b·ln(τ)+c·(1/T)",
+    )
+
+
 def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
@@ -920,6 +997,16 @@ def predict_temperature_improved(params: dict[str, float], D: float, tau: float,
     return 1.0 / inv_t - 273.15
 
 
+def predict_temperature_diameter_growth(params: dict[str, float], D: float, tau: float) -> float:
+    a2 = params.get("inv_T", np.nan)
+    if not np.isfinite(a2) or abs(a2) < 1e-12:
+        raise ValueError("В модели роста диаметра коэффициент при 1/T слишком мал для устойчивого расчета.")
+    inv_t = (np.log(D) - params.get("const", 0.0) - params.get("ln_tau", 0.0) * np.log(tau)) / a2
+    if inv_t <= 0:
+        raise ValueError("Модель роста диаметра дала неположительное значение 1/T.")
+    return 1.0 / inv_t - 273.15
+
+
 def predict_temperature_anchor_saturation(
     params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None
 ) -> float:
@@ -1172,6 +1259,13 @@ try:
 except Exception as exc:
     improved_error = str(exc)
 
+diameter_result = None
+diameter_error = None
+try:
+    diameter_result = fit_diameter_growth_model(prepared_df)
+except Exception as exc:
+    diameter_error = str(exc)
+
 anchor_result = None
 anchor_error = None
 try:
@@ -1205,13 +1299,16 @@ if base_result is not None:
     enrich_real_point_metrics(base_result, predict_temperature_engineering)
 if improved_result is not None:
     enrich_real_point_metrics(improved_result, predict_temperature_improved)
+if diameter_result is not None:
+    enrich_real_point_metrics(diameter_result, lambda params, D, tau, c_sigma, G: predict_temperature_diameter_growth(params, D, tau))
 if anchor_result is not None:
     enrich_real_point_metrics(anchor_result, predict_temperature_anchor_saturation)
 
-main_tab, grain_tab, improved_tab, anchor_tab, compare_tab, calculator_tab = st.tabs([
+main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab = st.tabs([
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
+    "Рост диаметра",
     "Простая sigma-модель",
     "Сравнение моделей",
     "Калькулятор",
@@ -1349,6 +1446,35 @@ with improved_tab:
                     f"Лучше всего улучшенная модель выглядит для номера зерна {best_grain['Номер зерна']}: "
                     f"R²={best_grain['R²']:.4f}, RMSE={best_grain['RMSE, °C']:.4f} °C."
                 )
+
+with diameter_tab:
+    st.write(
+        "Первый шаг для модели укрупнения: эмпирическая зависимость ln(D) = a + b·ln(τ) + c·(1/T). "
+        "Она соответствует инженерной форме coarsening-модели и позволяет проверить, насколько один только диаметр предсказывает температуру."
+    )
+    try:
+        if diameter_result is None:
+            raise ValueError(diameter_error or "неизвестная ошибка")
+        show_result_block(
+            diameter_result,
+            key_prefix="diameter_growth",
+            include_grain=False,
+            fit_function=fit_diameter_growth_model,
+        )
+        st.subheader("Калькулятор температуры по модели роста диаметра")
+        p = diameter_result.params.set_index("Параметр модели")["Значение"].to_dict()
+        c1, c2 = st.columns(2)
+        with c1:
+            tau_value = st.number_input("Время наработки τ для модели диаметра", min_value=1e-9, value=1000.0, step=100.0, format="%.6f")
+        with c2:
+            d_value = st.number_input("Эквивалентный диаметр D для модели диаметра", min_value=1e-9, value=10.0, step=0.1, format="%.6f")
+        try:
+            temp_value = predict_temperature_diameter_growth(p, d_value, tau_value)
+            st.metric("Расчетная температура по модели диаметра, °C", f"{temp_value:.4f}")
+        except Exception as exc:
+            st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
+    except Exception as exc:
+        st.error(f"Не удалось построить модель роста диаметра: {exc}")
 
 with anchor_tab:
     st.write(
