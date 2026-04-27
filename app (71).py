@@ -1100,7 +1100,7 @@ def build_cleaned_diameter_grain_results(prepared_df: pd.DataFrame, valid_grains
         except Exception:
             continue
         exclude_key = f"exclude_diameter_grain_{grain}"
-        selected = st.session_state.get(exclude_key, result.outlier_recommendation["point_id"].astype(str).tolist())
+        selected = st.session_state.get(exclude_key, [])
         if selected:
             filtered = grain_df[~grain_df["point_id"].astype(str).isin(selected)].copy()
             if len(filtered) >= 7:
@@ -1136,20 +1136,31 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
 
     X = sm.add_constant(coeff_df[["ln_grain_size"]])
     model_a = sm.OLS(coeff_df["a"], X).fit()
-    model_b = sm.OLS(coeff_df["b"], X).fit()
     model_c = sm.OLS(coeff_df["c"], X).fit()
+
+    b_source_df = coeff_df.sort_values(by=["R²", "grain_size_mm"], ascending=[False, False]).copy()
+    excluded_b_grain = None
+    if len(b_source_df) >= 4:
+        worst_row = b_source_df.sort_values(by=["R²", "grain_size_mm"], ascending=[True, False]).iloc[0]
+        excluded_b_grain = float(worst_row["G"])
+        b_source_df = b_source_df[b_source_df["G"] != excluded_b_grain].copy()
+    b_const = float(b_source_df["b"].mean())
+
     params = {
         "alpha0": float(model_a.params.get("const", np.nan)),
         "alpha1": float(model_a.params.get("ln_grain_size", np.nan)),
-        "beta0": float(model_b.params.get("const", np.nan)),
-        "beta1": float(model_b.params.get("ln_grain_size", np.nan)),
+        "b_const": b_const,
         "gamma0": float(model_c.params.get("const", np.nan)),
         "gamma1": float(model_c.params.get("ln_grain_size", np.nan)),
     }
+    included_b_grains = ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in b_source_df["G"].tolist())
+    excluded_b_text = "нет"
+    if excluded_b_grain is not None:
+        excluded_b_text = str(int(excluded_b_grain)) if excluded_b_grain.is_integer() else str(excluded_b_grain)
     summary_text = (
         "Метамодель коэффициентов очищенных зерновых моделей по размеру зерна.\n\n"
         f"a(dg)=alpha0+alpha1·ln(dg), R²={model_a.rsquared:.4f}\n"
-        f"b(dg)=beta0+beta1·ln(dg), R²={model_b.rsquared:.4f}\n"
+        f"b=const={b_const:.8f}, использованы зерна: {included_b_grains}, исключено зерно: {excluded_b_text}\n"
         f"c(dg)=gamma0+gamma1·ln(dg), R²={model_c.rsquared:.4f}"
     )
     return params, coeff_df, summary_text
@@ -1158,7 +1169,7 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
 def predict_temperature_diameter_universal(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
     ln_g = np.log(grain_size_mm)
     a_val = params["alpha0"] + params["alpha1"] * ln_g
-    b_val = params["beta0"] + params["beta1"] * ln_g
+    b_val = params["b_const"]
     c_val = params["gamma0"] + params["gamma1"] * ln_g
     if not np.isfinite(c_val) or abs(c_val) < 1e-12:
         raise ValueError("Универсальная модель дала слишком малый коэффициент при 1/T.")
@@ -1203,7 +1214,13 @@ def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
     except Exception as exc:
         st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
 
-    show_result_block(result, key_prefix=f"diameter_grain_{grain_value}", include_grain=False, fit_function=fit_diameter_growth_model)
+    show_result_block(
+        result,
+        key_prefix=f"diameter_grain_{grain_value}",
+        include_grain=False,
+        fit_function=fit_diameter_growth_model,
+        preselect_outliers=False,
+    )
 
 
 def predict_temperature_anchor_saturation(
@@ -1337,6 +1354,7 @@ def show_result_block(
     key_prefix: str = "main",
     include_grain: bool = True,
     fit_function=fit_engineering_model,
+    preselect_outliers: bool = True,
 ) -> None:
     st.subheader("Показатели качества модели")
     metric_cards(result.metrics)
@@ -1368,7 +1386,7 @@ def show_result_block(
         selected = st.multiselect(
             "Исключить точки из расчета",
             options=result.data["point_id"].astype(str).tolist(),
-            default=outlier_labels,
+            default=outlier_labels if preselect_outliers else [],
             key=f"exclude_{key_prefix}",
         )
         if selected:
@@ -1693,12 +1711,12 @@ with diameter_tab:
         try:
             universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
             formula_text = (
-                "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))\n"
+                "ln(D) = a(dg) + b·ln(τ) + c(dg)·(1/T(K))\n"
                 "a(dg) = alpha0 + alpha1·ln(dg)\n"
-                "b(dg) = beta0 + beta1·ln(dg)\n"
+                "b = const\n"
                 "c(dg) = gamma0 + gamma1·ln(dg)\n"
                 f"alpha0 = {universal_params['alpha0']:.8f}, alpha1 = {universal_params['alpha1']:.8f}\n"
-                f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}\n"
+                f"b = {universal_params['b_const']:.8f}\n"
                 f"gamma0 = {universal_params['gamma0']:.8f}, gamma1 = {universal_params['gamma1']:.8f}"
             )
             st.code(formula_text, language="text")
