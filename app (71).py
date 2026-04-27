@@ -1099,8 +1099,8 @@ def build_cleaned_diameter_grain_results(prepared_df: pd.DataFrame, valid_grains
             result = fit_diameter_growth_model(grain_df, include_grain=False)
         except Exception:
             continue
-        exclude_key = f"exclude_diameter_grain_{grain}"
-        selected = st.session_state.get(exclude_key, [])
+        apply_key = f"applied_exclude_diameter_grain_{grain}"
+        selected = st.session_state.get(apply_key, [])
         if selected:
             filtered = grain_df[~grain_df["point_id"].astype(str).isin(selected)].copy()
             if len(filtered) >= 7:
@@ -1220,6 +1220,7 @@ def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
         include_grain=False,
         fit_function=fit_diameter_growth_model,
         preselect_outliers=True,
+        auto_apply_selected=False,
     )
 
 
@@ -1355,6 +1356,7 @@ def show_result_block(
     include_grain: bool = True,
     fit_function=fit_engineering_model,
     preselect_outliers: bool = True,
+    auto_apply_selected: bool = True,
 ) -> None:
     st.subheader("Показатели качества модели")
     metric_cards(result.metrics)
@@ -1389,10 +1391,23 @@ def show_result_block(
             default=outlier_labels if preselect_outliers else [],
             key=f"exclude_{key_prefix}",
         )
-        if selected:
-            filtered = result.data[~result.data["point_id"].astype(str).isin(selected)].copy()
+        effective_selected = list(selected)
+        if not auto_apply_selected:
+            apply_key = f"applied_exclude_{key_prefix}"
+            c_apply, c_reset = st.columns(2)
+            with c_apply:
+                if st.button("Применить исключение выбранных точек", key=f"apply_{key_prefix}"):
+                    st.session_state[apply_key] = list(selected)
+            with c_reset:
+                if st.button("Сбросить исключения", key=f"reset_{key_prefix}"):
+                    st.session_state[apply_key] = []
+            effective_selected = st.session_state.get(apply_key, [])
+            if effective_selected:
+                st.info(f"Сейчас реально исключено точек: {len(effective_selected)}")
+        if effective_selected:
+            filtered = result.data[~result.data["point_id"].astype(str).isin(effective_selected)].copy()
             if len(filtered) >= 7:
-                st.info(f"Пересчет после исключения {len(selected)} точек.")
+                st.info(f"Пересчет после исключения {len(effective_selected)} точек.")
                 recalculated = fit_function(filtered, include_grain=include_grain)
                 metric_cards(recalculated.metrics)
                 st.dataframe(
