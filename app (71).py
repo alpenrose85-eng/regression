@@ -925,16 +925,19 @@ def predict_temperature_anchor_saturation(
 ) -> float:
     if c_sigma <= 0:
         raise ValueError("Для sigma-модели по зернам содержание сигма-фазы должно быть больше нуля.")
-    if G is None:
-        raise ValueError("Для модели по отдельным зернам нужно указать номер зерна G.")
 
-    grain_key = f"grain_{float(G)}_"
-    grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
-    if not grain_params:
-        grain_key = f"grain_{int(round(float(G)))}_"
+    if all(key in params for key in ["log_a", "p_exp", "m_exp"]):
+        grain_params = params
+    else:
+        if G is None:
+            raise ValueError("Для модели по отдельным зернам нужно указать номер зерна G.")
+        grain_key = f"grain_{float(G)}_"
         grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
-    if not grain_params:
-        raise ValueError(f"Для номера зерна G={G} нет отдельной sigma-модели.")
+        if not grain_params:
+            grain_key = f"grain_{int(round(float(G)))}_"
+            grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
+        if not grain_params:
+            raise ValueError(f"Для номера зерна G={G} нет отдельной sigma-модели.")
 
     log_a = grain_params.get("log_a", np.nan)
     p_exp = grain_params.get("p_exp", np.nan)
