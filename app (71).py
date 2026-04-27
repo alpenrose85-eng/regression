@@ -633,7 +633,13 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
     metrics = build_metrics(result_df, predictor_count=3)
     metrics["RMSE модели сигма-фазы, %"] = float(np.sqrt(mean_squared_error(result_df["c_sigma"], result_df["sigma_pred_pct"])))
     weak_points = result_df.sort_values(by=["abs_error", "standard_residual"], ascending=[False, False]).copy()
-    formula_text = "cσ = A · τ^p · ((T - 550) / 350)^m"
+    formula_text = (
+        "cσ = A · τ^p · ((T - 550) / 350)^m\n"
+        f"A = exp({log_a:.8f}) = {np.exp(log_a):.8f}\n"
+        f"p = {p_exp:.8f}\n"
+        f"m = {m_exp:.8f}\n"
+        f"Итог: cσ = {np.exp(log_a):.8f} · τ^{p_exp:.8f} · ((T - 550) / 350)^{m_exp:.8f}"
+    )
     summary_text = (
         "Прямая степенная sigma-модель для одного зерна.\n"
         f"Параметры: log(A)={log_a:.6f}, p={p_exp:.6f}, m={m_exp:.6f}."
@@ -743,6 +749,17 @@ def sigma_metric_summary(df: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def temperature_metric_summary(df: pd.DataFrame) -> dict[str, float]:
+    return {
+        "Количество точек": float(len(df)),
+        "R² по T": float(r2_score(df["T"], df["T_pred"])) if len(df) >= 2 else np.nan,
+        "RMSE по T, °C": float(np.sqrt(mean_squared_error(df["T"], df["T_pred"]))),
+        "MAE по T, °C": float(mean_absolute_error(df["T"], df["T_pred"])),
+        "MAPE по T, %": float(np.mean(np.abs(df["error_celsius"]) / np.maximum(np.abs(df["T"]), 1e-9)) * 100.0),
+        "Корреляция факт/модель по T": float(np.corrcoef(df["T"], df["T_pred"])[0, 1]) if len(df) >= 2 else np.nan,
+    }
+
+
 def sigma_scatter_fact_vs_pred(df: pd.DataFrame, title: str) -> None:
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.scatter(df["c_sigma"], df["sigma_pred_pct"], color="#1f77b4", s=70, alpha=0.8)
@@ -789,6 +806,10 @@ def sigma_vs_time_plot(df: pd.DataFrame, title: str) -> None:
 
 def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
     st.subheader(f"Sigma-модель для номера зерна {grain_value}")
+    st.caption("Сначала показана предсказательность модели по температуре, ниже — качество прямой подгонки по содержанию сигма-фазы.")
+    st.subheader("Качество предсказания температуры")
+    metric_cards(temperature_metric_summary(result.data))
+    st.subheader("Качество подгонки по содержанию сигма-фазы")
     sigma_metrics = sigma_metric_summary(result.data)
     metric_cards(sigma_metrics)
     st.subheader("Коэффициенты модели")
@@ -810,6 +831,9 @@ def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
             if len(filtered) >= 7:
                 st.info(f"Пересчет sigma-модели после исключения {len(selected)} точек.")
                 recalculated = fit_anchor_saturation_model(filtered, include_grain=False)
+                st.subheader("Качество предсказания температуры после пересчета")
+                metric_cards(temperature_metric_summary(recalculated.data))
+                st.subheader("Качество подгонки по содержанию сигма-фазы после пересчета")
                 metric_cards(sigma_metric_summary(recalculated.data))
                 st.dataframe(recalculated.params, use_container_width=True, hide_index=True)
                 st.code(recalculated.formula_text, language="text")
