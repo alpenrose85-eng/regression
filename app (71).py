@@ -471,33 +471,86 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
 
-    sigma_features = ["inv_T", "ln_tau"]
+    tau = df["tau"].to_numpy(dtype=float)
+    inv_t = df["inv_T"].to_numpy(dtype=float)
+    grain = df["G"].to_numpy(dtype=float) if include_grain else None
+    x_true = df["c_sigma"].to_numpy(dtype=float)
+
+    def jmak_sigma(params: np.ndarray, tau_vals: np.ndarray, inv_t_vals: np.ndarray, grain_vals: np.ndarray | None) -> np.ndarray:
+        log_k0, q_like, p_exp, n_exp = params[:4]
+        grain_coeff = params[4] if include_grain else 0.0
+        log_rate = log_k0 + q_like * inv_t_vals + p_exp * np.log(tau_vals)
+        if grain_vals is not None:
+            log_rate += grain_coeff * grain_vals
+        rate_term = np.exp(np.clip(log_rate, -60, 60))
+        transformed = np.power(rate_term, n_exp)
+        return SIGMA_SATURATION_LIMIT * (1.0 - np.exp(-transformed))
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        pred = jmak_sigma(params, tau, inv_t, grain)
+        penalty = 1e-4 * np.sum(np.square(params))
+        return np.append(pred - x_true, np.sqrt(penalty))
+
     if include_grain:
-        sigma_features.append("G")
+        x0 = np.array([-12.0, 8000.0, 0.35, 1.5, 0.0], dtype=float)
+        lower = np.array([-40.0, -20000.0, 0.01, 0.2, -2.0], dtype=float)
+        upper = np.array([10.0, 30000.0, 3.0, 6.0, 2.0], dtype=float)
+        param_rows = [("k0", "log_k0"), ("Q*", "q_like"), ("p", "p_exp"), ("n", "n_exp"), ("g", "grain_coeff")]
+    else:
+        x0 = np.array([-12.0, 8000.0, 0.35, 1.5], dtype=float)
+        lower = np.array([-40.0, -20000.0, 0.01, 0.2], dtype=float)
+        upper = np.array([10.0, 30000.0, 3.0, 6.0], dtype=float)
+        param_rows = [("k0", "log_k0"), ("Q*", "q_like"), ("p", "p_exp"), ("n", "n_exp")]
 
-    X_sigma = sm.add_constant(df[sigma_features])
-    y_sigma = df["sigma_saturation_logit"]
-    sigma_model = sm.OLS(y_sigma, X_sigma).fit()
+    fit = optimize.least_squares(
+        residuals,
+        x0=x0,
+        bounds=(lower, upper),
+        method="trf",
+        loss="soft_l1",
+        max_nfev=20000,
+    )
+    if not fit.success:
+        raise ValueError(f"JMAK/Avrami подгонка не сошлась: {fit.message}")
 
-    sigma_inv_coef = sigma_model.params.get("inv_T", np.nan)
-    if not np.isfinite(sigma_inv_coef) or abs(sigma_inv_coef) < 1e-12:
-        raise ValueError("В модели сигма-фазы коэффициент при 1/T слишком мал для обратного расчета температуры.")
+    params_vector = fit.x
+    x_pred = jmak_sigma(params_vector, tau, inv_t, grain)
 
-    sigma_numerator = y_sigma - sigma_model.params.get("const", 0.0) - sigma_model.params.get("ln_tau", 0.0) * df["ln_tau"]
-    if include_grain:
-        sigma_numerator = sigma_numerator - sigma_model.params.get("G", 0.0) * df["G"]
+    def solve_temperature_from_sigma(target_sigma: float, tau_value: float, grain_value: float | None = None) -> float:
+        if target_sigma <= 0 or target_sigma >= SIGMA_SATURATION_LIMIT:
+            raise ValueError("Для обратного расчета содержание сигма-фазы должно быть в диапазоне (0, 18).")
 
-    fitted_inv_t = sigma_numerator / sigma_inv_coef
-    if np.any(fitted_inv_t <= 0):
-        raise ValueError("Модель сигма-фазы дала неположительные значения 1/T.")
+        def f(temp_c: float) -> float:
+            temp_k = temp_c + 273.15
+            inv_temp = 1.0 / temp_k
+            grain_array = None if grain_value is None else np.array([grain_value], dtype=float)
+            pred = jmak_sigma(params_vector, np.array([tau_value], dtype=float), np.array([inv_temp], dtype=float), grain_array)[0]
+            return float(pred - target_sigma)
 
-    fitted_kelvin = 1.0 / fitted_inv_t
-    fitted_c = fitted_kelvin - 273.15
+        t_min = 550.0
+        t_max = 900.0
+        grid = np.linspace(t_min, t_max, 200)
+        values = [f(t) for t in grid]
+        for left, right, v_left, v_right in zip(grid[:-1], grid[1:], values[:-1], values[1:]):
+            if v_left == 0:
+                return float(left)
+            if v_left * v_right < 0:
+                return float(optimize.brentq(f, left, right))
+
+        best_idx = int(np.argmin(np.abs(values)))
+        return float(grid[best_idx])
+
+    fitted_c = np.array(
+        [solve_temperature_from_sigma(x, t, None if grain is None else g) for x, t, g in zip(x_true, tau, grain if grain is not None else np.zeros(len(df)))],
+        dtype=float,
+    )
+    fitted_kelvin = fitted_c + 273.15
+    fitted_inv_t = 1.0 / fitted_kelvin
 
     result_df = df.copy()
     result_df["inv_T_pred"] = fitted_inv_t
     result_df["T_pred"] = fitted_c
-    result_df["T_pred_sigma"] = fitted_c
+    result_df["sigma_pred_pct"] = x_pred
     result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
     result_df["abs_error"] = np.abs(result_df["error_celsius"])
     result_df["rel_error_pct"] = np.where(
@@ -516,51 +569,40 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
     weak_points = result_df.sort_values(
         by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
     ).copy()
-
     outlier_recommendation = weak_points[
         (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
         | (np.abs(weak_points["standard_residual"]) > 2)
-        | (weak_points["cooks_distance"] > 4 / len(result_df))
     ].copy()
 
-    sigma_conf = sigma_model.conf_int()
-    sigma_rows = [
-        ("s0", "sigma_const", "const"),
-        ("s1", "sigma_inv_T", "inv_T"),
-        ("s2", "sigma_ln_tau", "ln_tau"),
-    ]
-    if include_grain:
-        sigma_rows.append(("s3", "sigma_G", "G"))
-
+    param_names = [name for _, name in param_rows]
     params = pd.DataFrame(
         {
-            "Коэффициент": [r[0] for r in sigma_rows],
-            "Параметр модели": [r[1] for r in sigma_rows],
-            "Значение": [sigma_model.params.get(r[2], np.nan) for r in sigma_rows],
-            "StdErr": [sigma_model.bse.get(r[2], np.nan) for r in sigma_rows],
-            "t-статистика": [sigma_model.tvalues.get(r[2], np.nan) for r in sigma_rows],
-            "p-value": [sigma_model.pvalues.get(r[2], np.nan) for r in sigma_rows],
-            "Нижняя 95% граница": [sigma_conf.loc[r[2], 0] for r in sigma_rows],
-            "Верхняя 95% граница": [sigma_conf.loc[r[2], 1] for r in sigma_rows],
+            "Коэффициент": [label for label, _ in param_rows],
+            "Параметр модели": param_names,
+            "Значение": list(params_vector),
+            "StdErr": [np.nan] * len(param_rows),
+            "t-статистика": [np.nan] * len(param_rows),
+            "p-value": [np.nan] * len(param_rows),
+            "Нижняя 95% граница": [np.nan] * len(param_rows),
+            "Верхняя 95% граница": [np.nan] * len(param_rows),
         }
     )
 
-    metrics = build_metrics(result_df, predictor_count=len(sigma_rows))
-    metrics["RMSE сигма-модели (logit)"] = float(np.sqrt(mean_squared_error(y_sigma, sigma_model.predict(X_sigma))))
+    metrics = build_metrics(result_df, predictor_count=len(param_rows))
+    metrics["RMSE модели сигма-фазы, %"] = float(np.sqrt(mean_squared_error(x_true, x_pred)))
 
     formula_text = (
-        "log(cσ / (18 - cσ)) = s0 + s1·(1/T(K)) + s2·ln(τ)"
-        + (" + s3·G" if include_grain else "")
-        + "\n"
-        + "Эквивалентно: cσ/(18-cσ) = K·τ^p·exp(B/T(K))"
+        "cσ = 18·{1 - exp[-(k(T,G)·τ^p)^n]}\n"
+        "ln k(T,G) = log_k0 + q_like·(1/T(K))"
+        + (" + grain_coeff·G" if include_grain else "")
+        + "\nТемпература восстанавливается численно из cσ в окне 550–900 °C"
     )
 
     summary_text = (
-        "Физико-математическая модель только по содержанию сигма-фазы.\n\n"
-        f"Используется насыщаемая переменная log(cσ/(18-cσ)), где 18% — предельное содержание сигма-фазы. "
-        "Во времени заложен степенной закон через ln(τ), а температурная чувствительность учитывается через 1/T(K).\n"
-        "Такой вид соответствует схеме cσ/(18-cσ) = K·τ^p·exp(B/T), после логарифмирования.\n\n"
-        + sigma_model.summary().as_text()
+        "JMAK/Avrami-модель только по содержанию сигма-фазы.\n\n"
+        f"Предельное содержание сигма-фазы зафиксировано на уровне {SIGMA_SATURATION_LIMIT:.2f}%. "
+        "Прямая модель описывает рост фазы во времени, а температура восстанавливается обратным численным подбором в окне 550–900 °C.\n"
+        f"Статус подгонки: success={fit.success}, cost={float(fit.cost):.6f}, nfev={fit.nfev}, message={fit.message}."
     )
 
     return FitResult(
@@ -571,7 +613,7 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         model_summary=summary_text,
         outlier_recommendation=outlier_recommendation,
         formula_text=formula_text,
-        model_label="Степенная модель по содержанию сигма-фазы",
+        model_label="JMAK/Avrami модель по содержанию сигма-фазы",
     )
 
 
@@ -691,17 +733,38 @@ def predict_temperature_improved(params: dict[str, float], D: float, tau: float,
 def predict_temperature_anchor_saturation(
     params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None
 ) -> float:
-    sigma_value = sigma_saturation_feature(c_sigma)
-    inv_t = (
-        sigma_value
-        - params.get("sigma_const", 0.0)
-        - params.get("sigma_ln_tau", 0.0) * np.log(tau)
-        - (params.get("sigma_G", 0.0) * G if G is not None and "sigma_G" in params else 0.0)
-    ) / params.get("sigma_inv_T", np.nan)
+    if c_sigma <= 0 or c_sigma >= SIGMA_SATURATION_LIMIT:
+        raise ValueError("Для JMAK/Avrami модели содержание сигма-фазы должно быть в диапазоне (0, 18).")
 
-    if not np.isfinite(inv_t) or inv_t <= 0:
-        raise ValueError("Степенная модель по сигма-фазе дала неположительное значение 1/T.")
-    return 1.0 / inv_t - 273.15
+    log_k0 = params.get("log_k0", np.nan)
+    q_like = params.get("q_like", np.nan)
+    p_exp = params.get("p_exp", np.nan)
+    n_exp = params.get("n_exp", np.nan)
+    grain_coeff = params.get("grain_coeff", 0.0)
+
+    def sigma_at_temp(temp_c: float) -> float:
+        inv_temp = 1.0 / (temp_c + 273.15)
+        log_rate = log_k0 + q_like * inv_temp + p_exp * np.log(tau)
+        if G is not None:
+            log_rate += grain_coeff * G
+        rate_term = np.exp(np.clip(log_rate, -60, 60))
+        transformed = rate_term**n_exp
+        return float(SIGMA_SATURATION_LIMIT * (1.0 - np.exp(-transformed)))
+
+    def f(temp_c: float) -> float:
+        return sigma_at_temp(temp_c) - c_sigma
+
+    t_min, t_max = 550.0, 900.0
+    grid = np.linspace(t_min, t_max, 200)
+    values = [f(t) for t in grid]
+    for left, right, v_left, v_right in zip(grid[:-1], grid[1:], values[:-1], values[1:]):
+        if v_left == 0:
+            return float(left)
+        if v_left * v_right < 0:
+            return float(optimize.brentq(f, left, right))
+
+    best_idx = int(np.argmin(np.abs(values)))
+    return float(grid[best_idx])
 
 
 def show_model_comparison(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
@@ -724,7 +787,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
             "Метрика": metric_order,
             "Базовая модель": [base_result.metrics.get(metric, np.nan) for metric in metric_order],
             "Улучшенная модель": [improved_result.metrics.get(metric, np.nan) for metric in metric_order],
-            "Степенная модель по сигма-фазе": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
+            "JMAK/Avrami sigma-модель": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
         }
     )
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
@@ -746,7 +809,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
                 ),
             },
             {
-                "Модель": "Степенная модель по сигма-фазе",
+                "Модель": "JMAK/Avrami sigma-модель"},{
                 "Прогноз для реальной точки, °C": anchor_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
                 "Отклонение от диапазона 570–600 °C, °C": anchor_result.metrics.get(
                     "Отклонение реальной точки от диапазона, °C", np.nan
@@ -760,7 +823,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
 
 def show_multi_calculator(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
     st.subheader("Калькулятор температуры по моделям")
-    st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой, улучшенной и степенной модели по сигма-фазе.")
+    st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой, улучшенной и JMAK/Avrami модели по сигма-фазе.")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -787,13 +850,13 @@ def show_multi_calculator(base_result: FitResult, improved_result: FitResult, an
         with r2:
             st.metric("Температура по улучшенной модели, °C", f"{improved_temp:.4f}")
         with r3:
-            st.metric("Температура по модели сигма-фазы, °C", f"{anchor_temp:.4f}")
+            st.metric("Температура по JMAK/Avrami модели, °C", f"{anchor_temp:.4f}")
 
         calc_df = pd.DataFrame(
             [
                 {"Модель": "Базовая", "Расчетная температура, °C": base_temp},
                 {"Модель": "Улучшенная", "Расчетная температура, °C": improved_temp},
-                {"Модель": "Степенная модель по сигма-фазе", "Расчетная температура, °C": anchor_temp},
+                {"Модель": "JMAK/Avrami sigma-модель", "Расчетная температура, °C": anchor_temp},
             ]
         )
         st.dataframe(calc_df, use_container_width=True, hide_index=True)
@@ -967,7 +1030,7 @@ main_tab, grain_tab, improved_tab, anchor_tab, compare_tab, calculator_tab = st.
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
-    "Модель по сигма-фазе",
+    "JMAK/Avrami sigma-модель",
     "Сравнение моделей",
     "Калькулятор",
 ])
@@ -1107,9 +1170,9 @@ with improved_tab:
 
 with anchor_tab:
     st.write(
-        "Новая модель использует только содержание сигма-фазы. "
-        "Предполагается насыщаемый рост сигма-фазы к пределу 18%, а влияние времени задается степенным законом. "
-        "После логарифмирования используется зависимость log(cσ/(18-cσ)) = s0 + s1·(1/T) + s2·ln(τ) + s3·G."
+        "Новая модель использует только содержание сигма-фазы в форме JMAK/Avrami. "
+        "Рост сигма-фазы ограничен пределом 18%, а температура восстанавливается не прямой формулой, а численным подбором в окне 550–900 °C. "
+        "Это ближе к физике превращения, чем прежняя линейная обратная зависимость."
     )
     try:
         if anchor_result is None:
@@ -1126,7 +1189,7 @@ with anchor_tab:
             f"{anchor_result.metrics.get('Прогноз для реальной точки, °C', np.nan):.4f} °C."
         )
     except Exception as exc:
-        st.error(f"Не удалось построить модель по сигма-фазе: {exc}")
+        st.error(f"Не удалось построить JMAK/Avrami модель: {exc}")
 
 with compare_tab:
     if base_result is None:
@@ -1134,7 +1197,7 @@ with compare_tab:
     elif improved_result is None:
         st.error(f"Улучшенная модель недоступна для сравнения: {improved_error}")
     elif anchor_result is None:
-        st.error(f"Модель по сигма-фазе недоступна для сравнения: {anchor_error}")
+        st.error(f"JMAK/Avrami модель недоступна для сравнения: {anchor_error}")
     else:
         show_model_comparison(base_result, improved_result, anchor_result)
 
@@ -1150,13 +1213,13 @@ with compare_tab:
                         "Номер зерна": grain,
                         "R² базовая": base_grain_result.metrics["R²"],
                         "R² улучшенная": improved_grain_result.metrics["R²"],
-                        "R² сигма-модель": anchor_grain_result.metrics["R²"],
+                        "R² JMAK/Avrami": anchor_grain_result.metrics["R²"],
                         "RMSE базовая, °C": base_grain_result.metrics["RMSE, °C"],
                         "RMSE улучшенная, °C": improved_grain_result.metrics["RMSE, °C"],
-                        "RMSE сигма-модель, °C": anchor_grain_result.metrics["RMSE, °C"],
+                        "RMSE JMAK/Avrami, °C": anchor_grain_result.metrics["RMSE, °C"],
                         "MAPE базовая, %": base_grain_result.metrics["MAPE, %"],
                         "MAPE улучшенная, %": improved_grain_result.metrics["MAPE, %"],
-                        "MAPE сигма-модель, %": anchor_grain_result.metrics["MAPE, %"],
+                        "MAPE JMAK/Avrami, %": anchor_grain_result.metrics["MAPE, %"],
                     }
                 )
             except Exception:
@@ -1173,6 +1236,6 @@ with calculator_tab:
     elif improved_result is None:
         st.error(f"Калькулятор улучшенной модели недоступен: {improved_error}")
     elif anchor_result is None:
-        st.error(f"Калькулятор модели по сигма-фазе недоступен: {anchor_error}")
+        st.error(f"Калькулятор JMAK/Avrami модели недоступен: {anchor_error}")
     else:
         show_multi_calculator(base_result, improved_result, anchor_result)
