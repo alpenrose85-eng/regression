@@ -471,137 +471,169 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
 
-    tau = df["tau"].to_numpy(dtype=float)
-    temp_c = df["T"].to_numpy(dtype=float)
-    grain = df["G"].to_numpy(dtype=float) if include_grain else None
-    x_true = df["c_sigma"].to_numpy(dtype=float)
+    def fit_single_grain(grain_df: pd.DataFrame) -> tuple[sm.regression.linear_model.RegressionResultsWrapper, np.ndarray, np.ndarray]:
+        X = sm.add_constant(grain_df[["ln_tau", "inv_T"]])
+        y = grain_df["sigma_saturation_logit"]
+        model = sm.OLS(y, X).fit()
+        inv_coef = model.params.get("inv_T", np.nan)
+        if not np.isfinite(inv_coef) or abs(inv_coef) < 1e-12:
+            raise ValueError("Коэффициент при 1/T слишком мал для обратного расчета температуры.")
+        pred_logit = model.predict(X).to_numpy(dtype=float)
+        pred_sigma = SIGMA_SATURATION_LIMIT / (1.0 + np.exp(-pred_logit))
+        return model, pred_logit, pred_sigma
 
-    def simple_sigma_model(params: np.ndarray, tau_vals: np.ndarray, temp_vals_c: np.ndarray, grain_vals: np.ndarray | None) -> np.ndarray:
-        log_a, p_exp, m_exp = params[:3]
-        grain_coeff = params[3] if include_grain else 0.0
-        tau_term = np.power(np.maximum(tau_vals, 1e-12), p_exp)
-        temp_term = np.power(np.clip((temp_vals_c - 550.0) / 350.0, 1e-9, None), m_exp)
-        grain_term = np.exp(-grain_coeff * (grain_vals if grain_vals is not None else 0.0))
-        drive = np.exp(log_a) * tau_term * temp_term * grain_term
-        return SIGMA_SATURATION_LIMIT * (1.0 - np.exp(-drive))
-
-    def residuals(params: np.ndarray) -> np.ndarray:
-        pred = simple_sigma_model(params, tau, temp_c, grain)
-        penalty = 1e-4 * np.sum(np.square(params))
-        return np.append(pred - x_true, np.sqrt(penalty))
+    def solve_temp_from_model(params: dict[str, float], tau_value: float, sigma_value: float) -> float:
+        logit_value = sigma_saturation_feature(sigma_value)
+        inv_t = (logit_value - params["const"] - params["ln_tau"] * np.log(tau_value)) / params["inv_T"]
+        if not np.isfinite(inv_t) or inv_t <= 0:
+            raise ValueError("Модель по зерну дала неположительное значение 1/T.")
+        return float(1.0 / inv_t - 273.15)
 
     if include_grain:
-        x0 = np.array([-8.0, 0.35, 0.7, 0.03], dtype=float)
-        lower = np.array([-30.0, 0.01, 0.05, -0.5], dtype=float)
-        upper = np.array([5.0, 0.99, 3.0, 0.5], dtype=float)
-        param_rows = [("A", "log_a"), ("p", "p_exp"), ("m", "m_exp"), ("g", "grain_coeff")]
-    else:
-        x0 = np.array([-8.0, 0.35, 0.7], dtype=float)
-        lower = np.array([-30.0, 0.01, 0.05], dtype=float)
-        upper = np.array([5.0, 0.99, 3.0], dtype=float)
-        param_rows = [("A", "log_a"), ("p", "p_exp"), ("m", "m_exp")]
+        result_df = df.copy()
+        result_df["T_pred"] = np.nan
+        result_df["inv_T_pred"] = np.nan
+        result_df["sigma_pred_pct"] = np.nan
+        param_rows: list[dict[str, float | str]] = []
+        summary_parts: list[str] = []
+        valid_grains: list[float] = []
 
-    fit = optimize.least_squares(
-        residuals,
-        x0=x0,
-        bounds=(lower, upper),
-        method="trf",
-        loss="soft_l1",
-        max_nfev=20000,
-    )
-    if not fit.success:
-        raise ValueError(f"Подгонка простой sigma-модели не сошлась: {fit.message}")
+        for grain_value in sorted(df["G"].dropna().unique().tolist()):
+            grain_df = df[df["G"] == grain_value].copy()
+            if len(grain_df) < 7:
+                summary_parts.append(f"Зерно {grain_value}: пропущено, точек меньше 7.")
+                continue
+            model, pred_logit, pred_sigma = fit_single_grain(grain_df)
+            valid_grains.append(grain_value)
+            grain_params = model.params.to_dict()
+            inv_t_pred = (
+                grain_df["sigma_saturation_logit"] - grain_params["const"] - grain_params["ln_tau"] * grain_df["ln_tau"]
+            ) / grain_params["inv_T"]
+            temp_pred = 1.0 / inv_t_pred - 273.15
+            result_df.loc[grain_df.index, "inv_T_pred"] = inv_t_pred
+            result_df.loc[grain_df.index, "T_pred"] = temp_pred
+            result_df.loc[grain_df.index, "sigma_pred_pct"] = pred_sigma
+            summary_parts.append(f"--- Модель для зерна {grain_value} ---\n{model.summary().as_text()}")
+            for coef_label, coef_name in [("a", "const"), ("b", "ln_tau"), ("c", "inv_T")]:
+                param_rows.append(
+                    {
+                        "Коэффициент": f"{coef_label}(G={grain_value})",
+                        "Параметр модели": f"grain_{grain_value}_{coef_name}",
+                        "Значение": model.params.get(coef_name, np.nan),
+                        "StdErr": model.bse.get(coef_name, np.nan),
+                        "t-статистика": model.tvalues.get(coef_name, np.nan),
+                        "p-value": model.pvalues.get(coef_name, np.nan),
+                        "Нижняя 95% граница": model.conf_int().loc[coef_name, 0],
+                        "Верхняя 95% граница": model.conf_int().loc[coef_name, 1],
+                    }
+                )
 
-    params_vector = fit.x
-    x_pred = simple_sigma_model(params_vector, tau, temp_c, grain)
+        result_df = result_df.dropna(subset=["T_pred"]).copy()
+        if result_df.empty:
+            raise ValueError("Не удалось построить ни одной модели по отдельным зернам: недостаточно данных.")
 
-    def solve_temperature_from_sigma(target_sigma: float, tau_value: float, grain_value: float | None = None) -> float:
-        if target_sigma <= 0 or target_sigma >= SIGMA_SATURATION_LIMIT:
-            raise ValueError("Для обратного расчета содержание сигма-фазы должно быть в диапазоне (0, 18).")
+        result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
+        result_df["abs_error"] = np.abs(result_df["error_celsius"])
+        result_df["rel_error_pct"] = np.where(
+            result_df["T"] != 0,
+            result_df["abs_error"] / np.abs(result_df["T"]) * 100,
+            np.nan,
+        )
+        std_err = result_df["error_celsius"].std(ddof=1)
+        result_df["standard_residual"] = (
+            (result_df["error_celsius"] - result_df["error_celsius"].mean()) / std_err if np.isfinite(std_err) and std_err > 0 else 0.0
+        )
+        result_df["leverage"] = np.nan
+        result_df["cooks_distance"] = np.nan
 
-        def f(temp_value_c: float) -> float:
-            grain_array = None if grain_value is None else np.array([grain_value], dtype=float)
-            pred = simple_sigma_model(params_vector, np.array([tau_value], dtype=float), np.array([temp_value_c], dtype=float), grain_array)[0]
-            return float(pred - target_sigma)
+        params = pd.DataFrame(param_rows)
+        metrics = build_metrics(result_df, predictor_count=3)
+        metrics["RMSE модели сигма-фазы, %"] = float(np.sqrt(mean_squared_error(result_df["c_sigma"], result_df["sigma_pred_pct"])))
 
-        t_min = 550.0
-        t_max = 900.0
-        grid = np.linspace(t_min, t_max, 300)
-        values = [f(t) for t in grid]
-        for left, right, v_left, v_right in zip(grid[:-1], grid[1:], values[:-1], values[1:]):
-            if v_left == 0:
-                return float(left)
-            if v_left * v_right < 0:
-                return float(optimize.brentq(f, left, right))
-        best_idx = int(np.argmin(np.abs(values)))
-        return float(grid[best_idx])
+        real_grain = REAL_WORLD_POINT["G"]
+        matching = params[params["Параметр модели"].str.startswith(f"grain_{real_grain}_")]
+        if matching.empty:
+            metrics["Прогноз для реальной точки, °C"] = np.nan
+            metrics["Отклонение реальной точки от диапазона, °C"] = np.nan
+        else:
+            grain_params = {
+                row["Параметр модели"].split(f"grain_{real_grain}_", 1)[1]: row["Значение"]
+                for _, row in matching.iterrows()
+            }
+            real_temp = solve_temp_from_model(grain_params, REAL_WORLD_POINT["tau"], REAL_WORLD_POINT["c_sigma"])
+            metrics["Прогноз для реальной точки, °C"] = float(real_temp)
+            if REAL_WORLD_POINT["temp_min"] <= real_temp <= REAL_WORLD_POINT["temp_max"]:
+                metrics["Отклонение реальной точки от диапазона, °C"] = 0.0
+            elif real_temp < REAL_WORLD_POINT["temp_min"]:
+                metrics["Отклонение реальной точки от диапазона, °C"] = REAL_WORLD_POINT["temp_min"] - real_temp
+            else:
+                metrics["Отклонение реальной точки от диапазона, °C"] = real_temp - REAL_WORLD_POINT["temp_max"]
 
-    grain_iter = grain if grain is not None else np.zeros(len(df))
-    fitted_c = np.array(
-        [solve_temperature_from_sigma(x, t, None if grain is None else g) for x, t, g in zip(x_true, tau, grain_iter)],
-        dtype=float,
-    )
-    fitted_kelvin = fitted_c + 273.15
-    fitted_inv_t = 1.0 / fitted_kelvin
+        weak_points = result_df.sort_values(by=["abs_error", "standard_residual"], ascending=[False, False]).copy()
+        outlier_recommendation = weak_points[
+            (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
+            | (np.abs(weak_points["standard_residual"]) > 2)
+        ].copy()
 
+        formula_text = (
+            "Для каждого номера зерна отдельно:\n"
+            "log(cσ / (18 - cσ)) = a_G + b_G·ln(τ) + c_G·(1/T(K))\n"
+            "Температура восстанавливается своей подмоделью для заданного номера зерна."
+        )
+        summary_text = (
+            "Простая степенная sigma-модель по каждому номеру зерна отдельно.\n\n"
+            + "\n\n".join(summary_parts)
+        )
+        return FitResult(
+            data=result_df,
+            metrics=metrics,
+            params=params,
+            weak_points=weak_points,
+            model_summary=summary_text,
+            outlier_recommendation=outlier_recommendation,
+            formula_text=formula_text,
+            model_label="Степенная sigma-модель по отдельным зернам",
+        )
+
+    model, pred_logit, pred_sigma = fit_single_grain(df.copy())
+    params_dict = model.params.to_dict()
+    inv_t_pred = (df["sigma_saturation_logit"] - params_dict["const"] - params_dict["ln_tau"] * df["ln_tau"]) / params_dict["inv_T"]
+    temp_pred = 1.0 / inv_t_pred - 273.15
     result_df = df.copy()
-    result_df["inv_T_pred"] = fitted_inv_t
-    result_df["T_pred"] = fitted_c
-    result_df["sigma_pred_pct"] = x_pred
+    result_df["inv_T_pred"] = inv_t_pred
+    result_df["T_pred"] = temp_pred
+    result_df["sigma_pred_pct"] = pred_sigma
     result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
     result_df["abs_error"] = np.abs(result_df["error_celsius"])
-    result_df["rel_error_pct"] = np.where(
-        result_df["T"] != 0,
-        result_df["abs_error"] / np.abs(result_df["T"]) * 100,
-        np.nan,
-    )
+    result_df["rel_error_pct"] = np.where(result_df["T"] != 0, result_df["abs_error"] / np.abs(result_df["T"]) * 100, np.nan)
     std_err = result_df["error_celsius"].std(ddof=1)
-    if np.isfinite(std_err) and std_err > 0:
-        result_df["standard_residual"] = (result_df["error_celsius"] - result_df["error_celsius"].mean()) / std_err
-    else:
-        result_df["standard_residual"] = 0.0
+    result_df["standard_residual"] = (
+        (result_df["error_celsius"] - result_df["error_celsius"].mean()) / std_err if np.isfinite(std_err) and std_err > 0 else 0.0
+    )
     result_df["leverage"] = np.nan
     result_df["cooks_distance"] = np.nan
-
-    weak_points = result_df.sort_values(
-        by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
-    ).copy()
+    weak_points = result_df.sort_values(by=["abs_error", "standard_residual"], ascending=[False, False]).copy()
     outlier_recommendation = weak_points[
-        (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
-        | (np.abs(weak_points["standard_residual"]) > 2)
+        (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9)) | (np.abs(weak_points["standard_residual"]) > 2)
     ].copy()
-
-    param_names = [name for _, name in param_rows]
+    conf = model.conf_int()
     params = pd.DataFrame(
         {
-            "Коэффициент": [label for label, _ in param_rows],
-            "Параметр модели": param_names,
-            "Значение": list(params_vector),
-            "StdErr": [np.nan] * len(param_rows),
-            "t-статистика": [np.nan] * len(param_rows),
-            "p-value": [np.nan] * len(param_rows),
-            "Нижняя 95% граница": [np.nan] * len(param_rows),
-            "Верхняя 95% граница": [np.nan] * len(param_rows),
+            "Коэффициент": ["a", "b", "c"],
+            "Параметр модели": ["const", "ln_tau", "inv_T"],
+            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get("inv_T", np.nan)],
+            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get("inv_T", np.nan)],
+            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get("inv_T", np.nan)],
+            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get("inv_T", np.nan)],
+            "Нижняя 95% граница": [conf.loc["const", 0], conf.loc["ln_tau", 0], conf.loc["inv_T", 0]],
+            "Верхняя 95% граница": [conf.loc["const", 1], conf.loc["ln_tau", 1], conf.loc["inv_T", 1]],
         }
     )
-
-    metrics = build_metrics(result_df, predictor_count=len(param_rows))
-    metrics["RMSE модели сигма-фазы, %"] = float(np.sqrt(mean_squared_error(x_true, x_pred)))
-
-    formula_text = (
-        "cσ = 18·{1 - exp[-A·τ^p·((T-550)/350)^m·exp(-g·G)]}\n"
-        "Ограничения: 0 < p < 1, m > 0, T в диапазоне 550–900 °C\n"
-        "Температура восстанавливается численно из cσ в окне 550–900 °C"
-    )
-
-    summary_text = (
-        "Простая монотонная насыщаемая модель по содержанию сигма-фазы.\n\n"
-        f"Сигма-фаза ограничена сверху уровнем {SIGMA_SATURATION_LIMIT:.2f}%. "
-        "Рост сделан монотонным по времени и температуре, а влияние более мелкого зерна заложено как уменьшающий множитель.\n"
-        "Форма модели соответствует эмпирическому степенному закону с насыщением, без сложной JMAK-структуры.\n"
-        f"Статус подгонки: success={fit.success}, cost={float(fit.cost):.6f}, nfev={fit.nfev}, message={fit.message}."
-    )
-
+    metrics = build_metrics(result_df, predictor_count=3)
+    metrics["RMSE модели сигма-фазы, %"] = float(np.sqrt(mean_squared_error(result_df["c_sigma"], result_df["sigma_pred_pct"])))
+    weak_points = result_df.sort_values(by=["abs_error", "standard_residual"], ascending=[False, False]).copy()
+    formula_text = "log(cσ / (18 - cσ)) = a + b·ln(τ) + c·(1/T(K))"
+    summary_text = model.summary().as_text()
     return FitResult(
         data=result_df,
         metrics=metrics,
@@ -610,7 +642,7 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         model_summary=summary_text,
         outlier_recommendation=outlier_recommendation,
         formula_text=formula_text,
-        model_label="Простая насыщаемая степенная sigma-модель",
+        model_label="Степенная sigma-модель для одного зерна",
     )
 
 
@@ -731,34 +763,27 @@ def predict_temperature_anchor_saturation(
     params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None
 ) -> float:
     if c_sigma <= 0 or c_sigma >= SIGMA_SATURATION_LIMIT:
-        raise ValueError("Для sigma-модели содержание сигма-фазы должно быть в диапазоне (0, 18).")
+        raise ValueError("Для sigma-модели по зернам содержание сигма-фазы должно быть в диапазоне (0, 18).")
+    if G is None:
+        raise ValueError("Для модели по отдельным зернам нужно указать номер зерна G.")
 
-    log_a = params.get("log_a", np.nan)
-    p_exp = params.get("p_exp", np.nan)
-    m_exp = params.get("m_exp", np.nan)
-    grain_coeff = params.get("grain_coeff", 0.0)
+    grain_key = f"grain_{float(G)}_"
+    grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
+    if not grain_params:
+        grain_key = f"grain_{int(round(float(G)))}_"
+        grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
+    if not grain_params:
+        raise ValueError(f"Для номера зерна G={G} нет отдельной sigma-модели.")
 
-    def sigma_at_temp(temp_c: float) -> float:
-        tau_term = np.power(max(tau, 1e-12), p_exp)
-        temp_term = np.power(max((temp_c - 550.0) / 350.0, 1e-9), m_exp)
-        grain_term = np.exp(-grain_coeff * (G if G is not None else 0.0))
-        drive = np.exp(log_a) * tau_term * temp_term * grain_term
-        return float(SIGMA_SATURATION_LIMIT * (1.0 - np.exp(-drive)))
+    inv_coef = grain_params.get("inv_T", np.nan)
+    if not np.isfinite(inv_coef) or abs(inv_coef) < 1e-12:
+        raise ValueError("Коэффициент при 1/T слишком мал для устойчивого расчета.")
 
-    def f(temp_c: float) -> float:
-        return sigma_at_temp(temp_c) - c_sigma
-
-    t_min, t_max = 550.0, 900.0
-    grid = np.linspace(t_min, t_max, 300)
-    values = [f(t) for t in grid]
-    for left, right, v_left, v_right in zip(grid[:-1], grid[1:], values[:-1], values[1:]):
-        if v_left == 0:
-            return float(left)
-        if v_left * v_right < 0:
-            return float(optimize.brentq(f, left, right))
-
-    best_idx = int(np.argmin(np.abs(values)))
-    return float(grid[best_idx])
+    logit_value = sigma_saturation_feature(c_sigma)
+    inv_t = (logit_value - grain_params.get("const", 0.0) - grain_params.get("ln_tau", 0.0) * np.log(tau)) / inv_coef
+    if not np.isfinite(inv_t) or inv_t <= 0:
+        raise ValueError("Модель по отдельному зерну дала неположительное значение 1/T.")
+    return float(1.0 / inv_t - 273.15)
 
 
 def show_model_comparison(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
@@ -781,7 +806,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
             "Метрика": metric_order,
             "Базовая модель": [base_result.metrics.get(metric, np.nan) for metric in metric_order],
             "Улучшенная модель": [improved_result.metrics.get(metric, np.nan) for metric in metric_order],
-            "Простая sigma-модель": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
+            "Sigma-модель по зернам": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
         }
     )
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
@@ -803,7 +828,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
                 ),
             },
             {
-                "Модель": "Простая sigma-модель"},{
+                "Модель": "Sigma-модель по зернам",
                 "Прогноз для реальной точки, °C": anchor_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
                 "Отклонение от диапазона 570–600 °C, °C": anchor_result.metrics.get(
                     "Отклонение реальной точки от диапазона, °C", np.nan
@@ -817,7 +842,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
 
 def show_multi_calculator(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
     st.subheader("Калькулятор температуры по моделям")
-    st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой, улучшенной и простой sigma-модели.")
+    st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой, улучшенной и sigma-модели по отдельным зернам.")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -844,13 +869,13 @@ def show_multi_calculator(base_result: FitResult, improved_result: FitResult, an
         with r2:
             st.metric("Температура по улучшенной модели, °C", f"{improved_temp:.4f}")
         with r3:
-            st.metric("Температура по простой sigma-модели, °C", f"{anchor_temp:.4f}")
+            st.metric("Температура по sigma-модели по зернам, °C", f"{anchor_temp:.4f}")
 
         calc_df = pd.DataFrame(
             [
                 {"Модель": "Базовая", "Расчетная температура, °C": base_temp},
                 {"Модель": "Улучшенная", "Расчетная температура, °C": improved_temp},
-                {"Модель": "Простая sigma-модель", "Расчетная температура, °C": anchor_temp},
+                {"Модель": "Sigma-модель по зернам", "Расчетная температура, °C": anchor_temp},
             ]
         )
         st.dataframe(calc_df, use_container_width=True, hide_index=True)
@@ -1164,9 +1189,9 @@ with improved_tab:
 
 with anchor_tab:
     st.write(
-        "Новая модель использует только содержание сигма-фазы и строится как простая монотонная насыщаемая степенная зависимость. "
-        "Она принудительно растет с температурой, со временем, уменьшается при более мелком зерне и ограничена сверху 18%. "
-        "Температура, как и раньше, восстанавливается численно в диапазоне 550–900 °C."
+        "Новая модель строится отдельно для каждого номера зерна. "
+        "Для каждого G подбирается своя простая степенная зависимость по содержанию сигма-фазы, времени и температуре. "
+        "После этого температура восстанавливается уже по подмодели соответствующего зерна."
     )
     try:
         if anchor_result is None:
@@ -1183,7 +1208,7 @@ with anchor_tab:
             f"{anchor_result.metrics.get('Прогноз для реальной точки, °C', np.nan):.4f} °C."
         )
     except Exception as exc:
-        st.error(f"Не удалось построить простую sigma-модель: {exc}")
+        st.error(f"Не удалось построить sigma-модель по отдельным зернам: {exc}")
 
 with compare_tab:
     if base_result is None:
@@ -1191,7 +1216,7 @@ with compare_tab:
     elif improved_result is None:
         st.error(f"Улучшенная модель недоступна для сравнения: {improved_error}")
     elif anchor_result is None:
-        st.error(f"Простая sigma-модель недоступна для сравнения: {anchor_error}")
+        st.error(f"Sigma-модель по отдельным зернам недоступна для сравнения: {anchor_error}")
     else:
         show_model_comparison(base_result, improved_result, anchor_result)
 
@@ -1207,13 +1232,13 @@ with compare_tab:
                         "Номер зерна": grain,
                         "R² базовая": base_grain_result.metrics["R²"],
                         "R² улучшенная": improved_grain_result.metrics["R²"],
-                        "R² simple sigma": anchor_grain_result.metrics["R²"],
+                        "R² sigma по зерну": anchor_grain_result.metrics["R²"]},{
                         "RMSE базовая, °C": base_grain_result.metrics["RMSE, °C"],
                         "RMSE улучшенная, °C": improved_grain_result.metrics["RMSE, °C"],
-                        "RMSE simple sigma, °C": anchor_grain_result.metrics["RMSE, °C"],
+                        "RMSE sigma по зерну, °C": anchor_grain_result.metrics["RMSE, °C"]},{
                         "MAPE базовая, %": base_grain_result.metrics["MAPE, %"],
                         "MAPE улучшенная, %": improved_grain_result.metrics["MAPE, %"],
-                        "MAPE simple sigma, %": anchor_grain_result.metrics["MAPE, %"],
+                        "MAPE sigma по зерну, %": anchor_grain_result.metrics["MAPE, %"]},{
                     }
                 )
             except Exception:
@@ -1230,6 +1255,6 @@ with calculator_tab:
     elif improved_result is None:
         st.error(f"Калькулятор улучшенной модели недоступен: {improved_error}")
     elif anchor_result is None:
-        st.error(f"Калькулятор простой sigma-модели недоступен: {anchor_error}")
+        st.error(f"Калькулятор sigma-модели по отдельным зернам недоступен: {anchor_error}")
     else:
         show_multi_calculator(base_result, improved_result, anchor_result)
