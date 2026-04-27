@@ -472,53 +472,32 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
 
     sigma_features = ["inv_T", "ln_tau"]
-    diameter_features = ["inv_T", "ln_tau"]
     if include_grain:
         sigma_features.append("G")
-        diameter_features.append("G")
 
     X_sigma = sm.add_constant(df[sigma_features])
     y_sigma = df["sigma_saturation_logit"]
     sigma_model = sm.OLS(y_sigma, X_sigma).fit()
 
-    X_diameter = sm.add_constant(df[diameter_features])
-    y_diameter = df["ln_D"]
-    diameter_model = sm.OLS(y_diameter, X_diameter).fit()
-
     sigma_inv_coef = sigma_model.params.get("inv_T", np.nan)
-    diameter_inv_coef = diameter_model.params.get("inv_T", np.nan)
     if not np.isfinite(sigma_inv_coef) or abs(sigma_inv_coef) < 1e-12:
         raise ValueError("В модели сигма-фазы коэффициент при 1/T слишком мал для обратного расчета температуры.")
-    if not np.isfinite(diameter_inv_coef) or abs(diameter_inv_coef) < 1e-12:
-        raise ValueError("В модели эквивалентного диаметра коэффициент при 1/T слишком мал для обратного расчета температуры.")
 
     sigma_numerator = y_sigma - sigma_model.params.get("const", 0.0) - sigma_model.params.get("ln_tau", 0.0) * df["ln_tau"]
-    diameter_numerator = y_diameter - diameter_model.params.get("const", 0.0) - diameter_model.params.get("ln_tau", 0.0) * df["ln_tau"]
     if include_grain:
         sigma_numerator = sigma_numerator - sigma_model.params.get("G", 0.0) * df["G"]
-        diameter_numerator = diameter_numerator - diameter_model.params.get("G", 0.0) * df["G"]
 
-    inv_t_sigma = sigma_numerator / sigma_inv_coef
-    inv_t_diameter = diameter_numerator / diameter_inv_coef
-    if np.any(inv_t_sigma <= 0):
+    fitted_inv_t = sigma_numerator / sigma_inv_coef
+    if np.any(fitted_inv_t <= 0):
         raise ValueError("Модель сигма-фазы дала неположительные значения 1/T.")
-    if np.any(inv_t_diameter <= 0):
-        raise ValueError("Модель эквивалентного диаметра дала неположительные значения 1/T.")
 
-    sigma_rmse = float(np.sqrt(mean_squared_error(y_sigma, sigma_model.predict(X_sigma))))
-    diameter_rmse = float(np.sqrt(mean_squared_error(y_diameter, diameter_model.predict(X_diameter))))
-    sigma_weight = 1.0 / max(sigma_rmse, 1e-9)
-    diameter_weight = 1.0 / max(diameter_rmse, 1e-9)
-
-    fitted_inv_t = (sigma_weight * inv_t_sigma + diameter_weight * inv_t_diameter) / (sigma_weight + diameter_weight)
     fitted_kelvin = 1.0 / fitted_inv_t
     fitted_c = fitted_kelvin - 273.15
 
     result_df = df.copy()
     result_df["inv_T_pred"] = fitted_inv_t
     result_df["T_pred"] = fitted_c
-    result_df["T_pred_sigma"] = 1.0 / inv_t_sigma - 273.15
-    result_df["T_pred_diameter"] = 1.0 / inv_t_diameter - 273.15
+    result_df["T_pred_sigma"] = fitted_c
     result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
     result_df["abs_error"] = np.abs(result_df["error_celsius"])
     result_df["rel_error_pct"] = np.where(
@@ -545,70 +524,43 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
     ].copy()
 
     sigma_conf = sigma_model.conf_int()
-    diameter_conf = diameter_model.conf_int()
     sigma_rows = [
         ("s0", "sigma_const", "const"),
         ("s1", "sigma_inv_T", "inv_T"),
         ("s2", "sigma_ln_tau", "ln_tau"),
     ]
-    diameter_rows = [
-        ("d0", "diameter_const", "const"),
-        ("d1", "diameter_inv_T", "inv_T"),
-        ("d2", "diameter_ln_tau", "ln_tau"),
-    ]
     if include_grain:
         sigma_rows.append(("s3", "sigma_G", "G"))
-        diameter_rows.append(("d3", "diameter_G", "G"))
 
     params = pd.DataFrame(
         {
-            "Коэффициент": [r[0] for r in sigma_rows + diameter_rows]
-            + ["wσ", "wD"],
-            "Параметр модели": [r[1] for r in sigma_rows + diameter_rows]
-            + ["sigma_weight", "diameter_weight"],
-            "Значение": [sigma_model.params.get(r[2], np.nan) for r in sigma_rows]
-            + [diameter_model.params.get(r[2], np.nan) for r in diameter_rows]
-            + [sigma_weight, diameter_weight],
-            "StdErr": [sigma_model.bse.get(r[2], np.nan) for r in sigma_rows]
-            + [diameter_model.bse.get(r[2], np.nan) for r in diameter_rows]
-            + [np.nan, np.nan],
-            "t-статистика": [sigma_model.tvalues.get(r[2], np.nan) for r in sigma_rows]
-            + [diameter_model.tvalues.get(r[2], np.nan) for r in diameter_rows]
-            + [np.nan, np.nan],
-            "p-value": [sigma_model.pvalues.get(r[2], np.nan) for r in sigma_rows]
-            + [diameter_model.pvalues.get(r[2], np.nan) for r in diameter_rows]
-            + [np.nan, np.nan],
-            "Нижняя 95% граница": [sigma_conf.loc[r[2], 0] for r in sigma_rows]
-            + [diameter_conf.loc[r[2], 0] for r in diameter_rows]
-            + [np.nan, np.nan],
-            "Верхняя 95% граница": [sigma_conf.loc[r[2], 1] for r in sigma_rows]
-            + [diameter_conf.loc[r[2], 1] for r in diameter_rows]
-            + [np.nan, np.nan],
+            "Коэффициент": [r[0] for r in sigma_rows],
+            "Параметр модели": [r[1] for r in sigma_rows],
+            "Значение": [sigma_model.params.get(r[2], np.nan) for r in sigma_rows],
+            "StdErr": [sigma_model.bse.get(r[2], np.nan) for r in sigma_rows],
+            "t-статистика": [sigma_model.tvalues.get(r[2], np.nan) for r in sigma_rows],
+            "p-value": [sigma_model.pvalues.get(r[2], np.nan) for r in sigma_rows],
+            "Нижняя 95% граница": [sigma_conf.loc[r[2], 0] for r in sigma_rows],
+            "Верхняя 95% граница": [sigma_conf.loc[r[2], 1] for r in sigma_rows],
         }
     )
 
-    metrics = build_metrics(result_df, predictor_count=len(sigma_rows) + len(diameter_rows))
-    metrics["RMSE сигма-модели (logit) "] = sigma_rmse
-    metrics["RMSE модели диаметра (lnD)"] = diameter_rmse
+    metrics = build_metrics(result_df, predictor_count=len(sigma_rows))
+    metrics["RMSE сигма-модели (logit)"] = float(np.sqrt(mean_squared_error(y_sigma, sigma_model.predict(X_sigma))))
 
     formula_text = (
         "log(cσ / (18 - cσ)) = s0 + s1·(1/T(K)) + s2·ln(τ)"
-        + (" + s3·G\n" if include_grain else "\n")
-        + "ln(D) = d0 + d1·(1/T(K)) + d2·ln(τ)"
-        + (" + d3·G\n" if include_grain else "\n")
-        + "1/T_combined = (wσ·1/Tσ + wD·1/TD) / (wσ + wD)"
+        + (" + s3·G" if include_grain else "")
+        + "\n"
+        + "Эквивалентно: cσ/(18-cσ) = K·τ^p·exp(B/T(K))"
     )
 
     summary_text = (
-        "Раздельная физико-математическая модель: сигма-фаза и эквивалентный диаметр описываются отдельно, "
-        "поскольку между ними может нарушаться корреляция из-за погрешностей измерения.\n\n"
-        f"Модель сигма-фазы использует насыщаемую переменную log(cσ/(18-cσ)), где 18% — предельное содержание сигма-фазы.\n"
-        "Модель диаметра использует ln(D).\n"
-        "Температура для каждой точки восстанавливается независимо из обеих моделей, затем объединяется взвешиванием по обратным ошибкам подгонки.\n\n"
-        + "--- Модель сигма-фазы ---\n"
+        "Физико-математическая модель только по содержанию сигма-фазы.\n\n"
+        f"Используется насыщаемая переменная log(cσ/(18-cσ)), где 18% — предельное содержание сигма-фазы. "
+        "Во времени заложен степенной закон через ln(τ), а температурная чувствительность учитывается через 1/T(K).\n"
+        "Такой вид соответствует схеме cσ/(18-cσ) = K·τ^p·exp(B/T), после логарифмирования.\n\n"
         + sigma_model.summary().as_text()
-        + "\n\n--- Модель эквивалентного диаметра ---\n"
-        + diameter_model.summary().as_text()
     )
 
     return FitResult(
@@ -619,7 +571,7 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         model_summary=summary_text,
         outlier_recommendation=outlier_recommendation,
         formula_text=formula_text,
-        model_label="Раздельная модель: сигма-фаза и эквивалентный диаметр",
+        model_label="Степенная модель по содержанию сигма-фазы",
     )
 
 
@@ -740,30 +692,15 @@ def predict_temperature_anchor_saturation(
     params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None
 ) -> float:
     sigma_value = sigma_saturation_feature(c_sigma)
-    sigma_inv_t = (
+    inv_t = (
         sigma_value
         - params.get("sigma_const", 0.0)
         - params.get("sigma_ln_tau", 0.0) * np.log(tau)
         - (params.get("sigma_G", 0.0) * G if G is not None and "sigma_G" in params else 0.0)
     ) / params.get("sigma_inv_T", np.nan)
 
-    diameter_inv_t = (
-        np.log(D)
-        - params.get("diameter_const", 0.0)
-        - params.get("diameter_ln_tau", 0.0) * np.log(tau)
-        - (params.get("diameter_G", 0.0) * G if G is not None and "diameter_G" in params else 0.0)
-    ) / params.get("diameter_inv_T", np.nan)
-
-    if not np.isfinite(sigma_inv_t) or sigma_inv_t <= 0:
-        raise ValueError("Раздельная модель сигма-фазы дала неположительное значение 1/T.")
-    if not np.isfinite(diameter_inv_t) or diameter_inv_t <= 0:
-        raise ValueError("Раздельная модель диаметра дала неположительное значение 1/T.")
-
-    sigma_weight = params.get("sigma_weight", 1.0)
-    diameter_weight = params.get("diameter_weight", 1.0)
-    inv_t = (sigma_weight * sigma_inv_t + diameter_weight * diameter_inv_t) / (sigma_weight + diameter_weight)
-    if inv_t <= 0:
-        raise ValueError("Раздельная комбинированная модель дала неположительное значение 1/T.")
+    if not np.isfinite(inv_t) or inv_t <= 0:
+        raise ValueError("Степенная модель по сигма-фазе дала неположительное значение 1/T.")
     return 1.0 / inv_t - 273.15
 
 
@@ -787,7 +724,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
             "Метрика": metric_order,
             "Базовая модель": [base_result.metrics.get(metric, np.nan) for metric in metric_order],
             "Улучшенная модель": [improved_result.metrics.get(metric, np.nan) for metric in metric_order],
-            "Раздельная модель": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
+            "Степенная модель по сигма-фазе": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
         }
     )
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
@@ -809,7 +746,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
                 ),
             },
             {
-                "Модель": "Раздельная модель",
+                "Модель": "Степенная модель по сигма-фазе",
                 "Прогноз для реальной точки, °C": anchor_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
                 "Отклонение от диапазона 570–600 °C, °C": anchor_result.metrics.get(
                     "Отклонение реальной точки от диапазона, °C", np.nan
@@ -823,7 +760,7 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
 
 def show_multi_calculator(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
     st.subheader("Калькулятор температуры по моделям")
-    st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой, улучшенной и раздельной моделям.")
+    st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой, улучшенной и sigma-only моделям.")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -850,13 +787,13 @@ def show_multi_calculator(base_result: FitResult, improved_result: FitResult, an
         with r2:
             st.metric("Температура по улучшенной модели, °C", f"{improved_temp:.4f}")
         with r3:
-            st.metric("Температура по раздельной модели, °C", f"{anchor_temp:.4f}")
+            st.metric("Температура по модели сигма-фазы, °C", f"{anchor_temp:.4f}")
 
         calc_df = pd.DataFrame(
             [
                 {"Модель": "Базовая", "Расчетная температура, °C": base_temp},
                 {"Модель": "Улучшенная", "Расчетная температура, °C": improved_temp},
-                {"Модель": "Раздельная модель", "Расчетная температура, °C": anchor_temp},
+                {"Модель": "Степенная модель по сигма-фазе", "Расчетная температура, °C": anchor_temp},
             ]
         )
         st.dataframe(calc_df, use_container_width=True, hide_index=True)
@@ -1030,7 +967,7 @@ main_tab, grain_tab, improved_tab, anchor_tab, compare_tab, calculator_tab = st.
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
-    "Раздельная модель",
+    "Модель по сигма-фазе",
     "Сравнение моделей",
     "Калькулятор",
 ])
@@ -1170,11 +1107,9 @@ with improved_tab:
 
 with anchor_tab:
     st.write(
-        "Новая модель разделяет описание сигма-фазы и эквивалентного диаметра. "
-        "Для сигма-фазы строится отдельная насыщаемая зависимость через log(cσ/(18-cσ)), "
-        "для эквивалентного диаметра — отдельная зависимость через ln(D). "
-        "Температура затем восстанавливается отдельно из каждой модели и объединяется взвешенно, "
-        "чтобы ослабить влияние ошибок измерения и разрушенной корреляции между cσ и D."
+        "Новая модель использует только содержание сигма-фазы. "
+        "Предполагается насыщаемый рост сигма-фазы к пределу 18%, а влияние времени задается степенным законом. "
+        "После логарифмирования используется зависимость log(cσ/(18-cσ)) = s0 + s1·(1/T) + s2·ln(τ) + s3·G."
     )
     try:
         if anchor_result is None:
@@ -1191,7 +1126,7 @@ with anchor_tab:
             f"{anchor_result.metrics.get('Прогноз для реальной точки, °C', np.nan):.4f} °C."
         )
     except Exception as exc:
-        st.error(f"Не удалось построить раздельную модель: {exc}")
+        st.error(f"Не удалось построить модель по сигма-фазе: {exc}")
 
 with compare_tab:
     if base_result is None:
@@ -1199,7 +1134,7 @@ with compare_tab:
     elif improved_result is None:
         st.error(f"Улучшенная модель недоступна для сравнения: {improved_error}")
     elif anchor_result is None:
-        st.error(f"Раздельная модель недоступна для сравнения: {anchor_error}")
+        st.error(f"Модель по сигма-фазе недоступна для сравнению: {anchor_error}")
     else:
         show_model_comparison(base_result, improved_result, anchor_result)
 
@@ -1215,13 +1150,13 @@ with compare_tab:
                         "Номер зерна": grain,
                         "R² базовая": base_grain_result.metrics["R²"],
                         "R² улучшенная": improved_grain_result.metrics["R²"],
-                        "R² раздельная": anchor_grain_result.metrics["R²"],
+                        "R² сигма-модель": anchor_grain_result.metrics["R²"],
                         "RMSE базовая, °C": base_grain_result.metrics["RMSE, °C"],
                         "RMSE улучшенная, °C": improved_grain_result.metrics["RMSE, °C"],
-                        "RMSE раздельная, °C": anchor_grain_result.metrics["RMSE, °C"],
+                        "RMSE сигма-модель, °C": anchor_grain_result.metrics["RMSE, °C"],
                         "MAPE базовая, %": base_grain_result.metrics["MAPE, %"],
                         "MAPE улучшенная, %": improved_grain_result.metrics["MAPE, %"],
-                        "MAPE раздельная, %": anchor_grain_result.metrics["MAPE, %"],
+                        "MAPE сигма-модель, %": anchor_grain_result.metrics["MAPE, %"],
                     }
                 )
             except Exception:
@@ -1238,6 +1173,6 @@ with calculator_tab:
     elif improved_result is None:
         st.error(f"Калькулятор улучшенной модели недоступен: {improved_error}")
     elif anchor_result is None:
-        st.error(f"Калькулятор раздельной модели недоступен: {anchor_error}")
+        st.error(f"Калькулятор модели по сигма-фазе недоступен: {anchor_error}")
     else:
         show_multi_calculator(base_result, improved_result, anchor_result)
