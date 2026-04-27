@@ -503,14 +503,69 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         ridge_penalty = ridge_weight * float(np.sum(np.square(params)))
         return train_loss + anchor_weight * anchor_penalty + ridge_penalty
 
-    optimization = optimize.minimize(objective, initial_params, method="L-BFGS-B")
-    if not optimization.success:
-        raise ValueError(f"Оптимизация якорной модели не сошлась: {optimization.message}")
+    candidate_starts = [
+        initial_params,
+        initial_params * 0.95,
+        initial_params * 1.05,
+        initial_params + np.array([1e-7] * len(initial_params), dtype=float),
+    ]
+    methods = [
+        ("L-BFGS-B", {"options": {"maxiter": 2000, "ftol": 1e-12, "gtol": 1e-9}}),
+        ("Powell", {"options": {"maxiter": 4000, "xtol": 1e-8, "ftol": 1e-8}}),
+        ("Nelder-Mead", {"options": {"maxiter": 4000, "xatol": 1e-8, "fatol": 1e-8}}),
+    ]
 
-    params_vector = optimization.x
+    best_result = None
+    best_method = None
+    best_value = np.inf
+    optimization_messages: list[str] = []
+
+    for start in candidate_starts:
+        for method, kwargs in methods:
+            try:
+                optimization = optimize.minimize(objective, start, method=method, **kwargs)
+                value = float(optimization.fun)
+                optimization_messages.append(
+                    f"{method}: success={optimization.success}, fun={value:.6f}, message={optimization.message}"
+                )
+                if np.isfinite(value) and value < best_value:
+                    best_value = value
+                    best_result = optimization
+                    best_method = method
+                if optimization.success and np.isfinite(value):
+                    best_result = optimization
+                    best_value = value
+                    best_method = method
+                    break
+            except Exception as exc:
+                optimization_messages.append(f"{method}: exception={exc}")
+        if best_result is not None and getattr(best_result, "success", False):
+            break
+
+    if best_result is None or not np.isfinite(best_value):
+        params_vector = initial_params
+        optimization_note = (
+            "Оптимизация якорной модели не дала устойчивого улучшения; использованы стартовые коэффициенты OLS без якорной подстройки."
+        )
+    else:
+        params_vector = best_result.x
+        if getattr(best_result, "success", False):
+            optimization_note = f"Оптимизация завершена методом {best_method}: {best_result.message}"
+        else:
+            optimization_note = (
+                "Строгий критерий успеха оптимизатора не выполнен, но выбрано лучшее найденное конечное решение. "
+                f"Лучший метод: {best_method}. Последний статус: {best_result.message}"
+            )
+
     fitted_inv_t = X @ params_vector
     if np.any(fitted_inv_t <= 0):
-        raise ValueError("Якорная модель дала неположительные значения 1/T на обучающих точках.")
+        params_vector = initial_params
+        fitted_inv_t = X @ params_vector
+        optimization_note += (
+            " После оптимизации получались неположительные значения 1/T, поэтому выполнен откат к стартовым коэффициентам OLS."
+        )
+        if np.any(fitted_inv_t <= 0):
+            raise ValueError("Якорная модель дала неположительные значения 1/T даже после отката к стартовым коэффициентам.")
 
     fitted_kelvin = 1.0 / fitted_inv_t
     fitted_c = fitted_kelvin - 273.15
@@ -591,6 +646,8 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         "\n\nЯкорная настройка: модель дополнительно штрафуется, если прогноз для реальной точки "
         f"(τ={REAL_WORLD_POINT['tau']:.0f} ч, D={REAL_WORLD_POINT['D']}, cσ={REAL_WORLD_POINT['c_sigma']}, G={REAL_WORLD_POINT['G']:.0f}) "
         f"выходит за диапазон {REAL_WORLD_POINT['temp_min']:.0f}–{REAL_WORLD_POINT['temp_max']:.0f} °C."
+        f"\n\nСтатус оптимизации: {optimization_note}"
+        f"\n\nЖурнал попыток: {' | '.join(optimization_messages[:12])}"
     )
 
     return FitResult(
