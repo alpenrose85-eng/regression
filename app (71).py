@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import streamlit as st
-from scipy import stats
+from scipy import optimize, stats
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
@@ -65,6 +65,16 @@ SIGMA_ALIASES = [
     "c sigma pct",
 ]
 ID_ALIASES = ["id", "sample", "sample_id", "образец", "точка"]
+
+SIGMA_SATURATION_LIMIT = 18.0
+REAL_WORLD_POINT = {
+    "tau": 150000.0,
+    "D": 7.9,
+    "c_sigma": 10.18,
+    "G": 10.0,
+    "temp_min": 570.0,
+    "temp_max": 600.0,
+}
 
 
 @dataclass
@@ -181,8 +191,21 @@ def prepare_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     prepared["ln_D"] = np.log(prepared["D"])
     prepared["ln_tau"] = np.log(prepared["tau"])
     prepared["ln_c_sigma"] = np.log(prepared["c_sigma"])
+    sigma_clipped = np.clip(prepared["c_sigma"], 1e-9, SIGMA_SATURATION_LIMIT - 1e-9)
+    prepared["sigma_remaining"] = SIGMA_SATURATION_LIMIT - sigma_clipped
+    prepared["sigma_saturation_logit"] = np.log(sigma_clipped / prepared["sigma_remaining"])
 
     return prepared.reset_index(drop=True)
+
+
+def sigma_saturation_feature(c_sigma: float, sigma_limit: float = SIGMA_SATURATION_LIMIT) -> float:
+    if c_sigma <= 0:
+        raise ValueError("Содержание сигма-фазы должно быть больше нуля.")
+    if c_sigma >= sigma_limit:
+        raise ValueError(
+            f"Содержание сигма-фазы должно быть меньше предельного уровня {sigma_limit:.2f}% для насыщаемой модели."
+        )
+    return float(np.log(c_sigma / (sigma_limit - c_sigma)))
 
 
 def approximation_reliability(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -432,6 +455,156 @@ def fit_improved_model(df: pd.DataFrame, include_grain: bool = True) -> FitResul
     )
 
 
+def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
+    if len(df) < 7:
+        raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
+
+    feature_columns = ["ln_D", "ln_tau", "sigma_saturation_logit"]
+    if include_grain:
+        feature_columns.insert(2, "G")
+
+    X_df = sm.add_constant(df[feature_columns])
+    X = X_df.to_numpy(dtype=float)
+    y_true_t = df["T"].to_numpy(dtype=float)
+
+    initial_model = sm.OLS(df["inv_T"], X_df).fit()
+    initial_params = initial_model.params.to_numpy(dtype=float)
+
+    anchor_features = [
+        1.0,
+        np.log(REAL_WORLD_POINT["D"]),
+        np.log(REAL_WORLD_POINT["tau"]),
+    ]
+    if include_grain:
+        anchor_features.append(float(REAL_WORLD_POINT["G"]))
+    anchor_features.append(sigma_saturation_feature(float(REAL_WORLD_POINT["c_sigma"])))
+    anchor_vector = np.array(anchor_features, dtype=float)
+
+    anchor_weight = max(len(df), 10) * 75.0
+    ridge_weight = 1e-6
+
+    def predict_temp(params: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+        inv_t = matrix @ params
+        if np.any(inv_t <= 0):
+            raise ValueError("Получено неположительное значение 1/T.")
+        return 1.0 / inv_t - 273.15
+
+    def objective(params: np.ndarray) -> float:
+        try:
+            pred_t = predict_temp(params, X)
+            anchor_pred = float(predict_temp(params, anchor_vector.reshape(1, -1))[0])
+        except ValueError:
+            return 1e12
+
+        train_loss = float(np.mean(np.square(y_true_t - pred_t)))
+        below = max(0.0, REAL_WORLD_POINT["temp_min"] - anchor_pred)
+        above = max(0.0, anchor_pred - REAL_WORLD_POINT["temp_max"])
+        anchor_penalty = below**2 + above**2
+        ridge_penalty = ridge_weight * float(np.sum(np.square(params)))
+        return train_loss + anchor_weight * anchor_penalty + ridge_penalty
+
+    optimization = optimize.minimize(objective, initial_params, method="L-BFGS-B")
+    if not optimization.success:
+        raise ValueError(f"Оптимизация якорной модели не сошлась: {optimization.message}")
+
+    params_vector = optimization.x
+    fitted_inv_t = X @ params_vector
+    if np.any(fitted_inv_t <= 0):
+        raise ValueError("Якорная модель дала неположительные значения 1/T на обучающих точках.")
+
+    fitted_kelvin = 1.0 / fitted_inv_t
+    fitted_c = fitted_kelvin - 273.15
+
+    surrogate_model = sm.OLS(df["inv_T"], X_df).fit()
+    influence = surrogate_model.get_influence()
+
+    result_df = df.copy()
+    result_df["inv_T_pred"] = fitted_inv_t
+    result_df["T_pred"] = fitted_c
+    result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
+    result_df["abs_error"] = np.abs(result_df["error_celsius"])
+    result_df["rel_error_pct"] = np.where(
+        result_df["T"] != 0,
+        result_df["abs_error"] / np.abs(result_df["T"]) * 100,
+        np.nan,
+    )
+    result_df["standard_residual"] = influence.resid_studentized_internal
+    result_df["leverage"] = influence.hat_matrix_diag
+    result_df["cooks_distance"] = influence.cooks_distance[0]
+
+    weak_points = result_df.sort_values(
+        by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
+    ).copy()
+
+    outlier_recommendation = weak_points[
+        (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
+        | (np.abs(weak_points["standard_residual"]) > 2)
+        | (weak_points["cooks_distance"] > 4 / len(result_df))
+    ].copy()
+
+    param_names = ["const", "ln_D", "ln_tau"]
+    coeff_labels = [("a", "const"), ("b", "ln_D"), ("c", "ln_tau")]
+    if include_grain:
+        param_names.append("G")
+        coeff_labels.append(("d", "G"))
+    param_names.append("sigma_saturation_logit")
+    coeff_labels.append(("e", "sigma_saturation_logit"))
+
+    params_series = pd.Series(params_vector, index=param_names)
+    conf_int = surrogate_model.conf_int()
+    params = pd.DataFrame(
+        {
+            "Коэффициент": [label for label, _ in coeff_labels],
+            "Параметр модели": [param for _, param in coeff_labels],
+            "Значение": [params_series.get(param, np.nan) for _, param in coeff_labels],
+            "StdErr": [surrogate_model.bse.get(param, np.nan) for _, param in coeff_labels],
+            "t-статистика": [surrogate_model.tvalues.get(param, np.nan) for _, param in coeff_labels],
+            "p-value": [surrogate_model.pvalues.get(param, np.nan) for _, param in coeff_labels],
+            "Нижняя 95% граница": [conf_int.loc[param, 0] for _, param in coeff_labels],
+            "Верхняя 95% граница": [conf_int.loc[param, 1] for _, param in coeff_labels],
+        }
+    )
+
+    metrics = build_metrics(result_df, predictor_count=len(feature_columns))
+    anchor_pred = float(1.0 / np.dot(anchor_vector, params_vector) - 273.15)
+    metrics["Прогноз для реальной точки, °C"] = anchor_pred
+    if REAL_WORLD_POINT["temp_min"] <= anchor_pred <= REAL_WORLD_POINT["temp_max"]:
+        metrics["Отклонение реальной точки от диапазона, °C"] = 0.0
+    elif anchor_pred < REAL_WORLD_POINT["temp_min"]:
+        metrics["Отклонение реальной точки от диапазона, °C"] = REAL_WORLD_POINT["temp_min"] - anchor_pred
+    else:
+        metrics["Отклонение реальной точки от диапазона, °C"] = anchor_pred - REAL_WORLD_POINT["temp_max"]
+
+    formula_text = (
+        "1 / T(K) = "
+        f"{params_series.get('const', np.nan):.8f} "
+        f"+ ({params_series.get('ln_D', np.nan):.8f})·ln(D) "
+        f"+ ({params_series.get('ln_tau', np.nan):.8f})·ln(τ) "
+    )
+    if include_grain:
+        formula_text += f"+ ({params_series.get('G', np.nan):.8f})·G "
+    formula_text += (
+        f"+ ({params_series.get('sigma_saturation_logit', np.nan):.8f})·ln(cσ / ({SIGMA_SATURATION_LIMIT:.2f} - cσ))"
+    )
+
+    summary_text = surrogate_model.summary().as_text() + (
+        "\n\nЯкорная настройка: модель дополнительно штрафуется, если прогноз для реальной точки "
+        f"(τ={REAL_WORLD_POINT['tau']:.0f} ч, D={REAL_WORLD_POINT['D']}, cσ={REAL_WORLD_POINT['c_sigma']}, G={REAL_WORLD_POINT['G']:.0f}) "
+        f"выходит за диапазон {REAL_WORLD_POINT['temp_min']:.0f}–{REAL_WORLD_POINT['temp_max']:.0f} °C."
+    )
+
+    return FitResult(
+        data=result_df,
+        metrics=metrics,
+        params=params,
+        weak_points=weak_points,
+        model_summary=summary_text,
+        outlier_recommendation=outlier_recommendation,
+        formula_text=formula_text,
+        model_label="Якорно-кинетическая модель с насыщением сигма-фазы",
+    )
+
+
 def metric_cards(metrics: dict[str, float]) -> None:
     keys = list(metrics.keys())
     cols = st.columns(4)
@@ -545,7 +718,23 @@ def predict_temperature_improved(params: dict[str, float], D: float, tau: float,
     return 1.0 / inv_t - 273.15
 
 
-def show_model_comparison(base_result: FitResult, improved_result: FitResult) -> None:
+def predict_temperature_anchor_saturation(
+    params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None
+) -> float:
+    inv_t = (
+        params.get("const", 0.0)
+        + params.get("ln_D", 0.0) * np.log(D)
+        + params.get("ln_tau", 0.0) * np.log(tau)
+        + params.get("sigma_saturation_logit", 0.0) * sigma_saturation_feature(c_sigma)
+    )
+    if G is not None and "G" in params:
+        inv_t += params.get("G", 0.0) * G
+    if inv_t <= 0:
+        raise ValueError("Якорно-кинетическая модель дала неположительное значение 1/T. Проверьте введенные параметры.")
+    return 1.0 / inv_t - 273.15
+
+
+def show_model_comparison(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
     st.subheader("Сравнение базовой и улучшенной моделей")
     metric_order = [
         "R²",
@@ -565,15 +754,41 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult) ->
             "Метрика": metric_order,
             "Базовая модель": [base_result.metrics.get(metric, np.nan) for metric in metric_order],
             "Улучшенная модель": [improved_result.metrics.get(metric, np.nan) for metric in metric_order],
+            "Якорно-кинетическая модель": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
         }
-    )
-    comparison_df["Разница (улучшенная - базовая)"] = (
-        comparison_df["Улучшенная модель"] - comparison_df["Базовая модель"]
     )
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
 
+    anchor_compare = pd.DataFrame(
+        [
+            {
+                "Модель": "Базовая",
+                "Прогноз для реальной точки, °C": base_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
+                "Отклонение от диапазона 570–600 °C, °C": base_result.metrics.get(
+                    "Отклонение реальной точки от диапазона, °C", np.nan
+                ),
+            },
+            {
+                "Модель": "Улучшенная",
+                "Прогноз для реальной точки, °C": improved_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
+                "Отклонение от диапазона 570–600 °C, °C": improved_result.metrics.get(
+                    "Отклонение реальной точки от диапазона, °C", np.nan
+                ),
+            },
+            {
+                "Модель": "Якорно-кинетическая",
+                "Прогноз для реальной точки, °C": anchor_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
+                "Отклонение от диапазона 570–600 °C, °C": anchor_result.metrics.get(
+                    "Отклонение реальной точки от диапазона, °C", np.nan
+                ),
+            },
+        ]
+    )
+    st.subheader("Проверка по важной реальной точке")
+    st.dataframe(anchor_compare, use_container_width=True, hide_index=True)
 
-def show_dual_calculator(base_result: FitResult, improved_result: FitResult) -> None:
+
+def show_multi_calculator(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
     st.subheader("Калькулятор температуры по двум моделям")
     st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой и улучшенной моделям.")
 
@@ -589,10 +804,12 @@ def show_dual_calculator(base_result: FitResult, improved_result: FitResult) -> 
 
     base_params = base_result.params.set_index("Параметр модели")["Значение"].to_dict()
     improved_params = improved_result.params.set_index("Параметр модели")["Значение"].to_dict()
+    anchor_params = anchor_result.params.set_index("Параметр модели")["Значение"].to_dict()
 
     try:
         base_temp = predict_temperature_engineering(base_params, d_value, tau_value, sigma_value, grain_value)
         improved_temp = predict_temperature_improved(improved_params, d_value, tau_value, sigma_value, grain_value)
+        anchor_temp = predict_temperature_anchor_saturation(anchor_params, d_value, tau_value, sigma_value, grain_value)
 
         r1, r2, r3 = st.columns(3)
         with r1:
@@ -600,12 +817,13 @@ def show_dual_calculator(base_result: FitResult, improved_result: FitResult) -> 
         with r2:
             st.metric("Температура по улучшенной модели, °C", f"{improved_temp:.4f}")
         with r3:
-            st.metric("Разница, °C", f"{(improved_temp - base_temp):.4f}")
+            st.metric("Температура по якорно-кинетической модели, °C", f"{anchor_temp:.4f}")
 
         calc_df = pd.DataFrame(
             [
                 {"Модель": "Базовая", "Расчетная температура, °C": base_temp},
                 {"Модель": "Улучшенная", "Расчетная температура, °C": improved_temp},
+                {"Модель": "Якорно-кинетическая", "Расчетная температура, °C": anchor_temp},
             ]
         )
         st.dataframe(calc_df, use_container_width=True, hide_index=True)
@@ -739,10 +957,45 @@ try:
 except Exception as exc:
     improved_error = str(exc)
 
-main_tab, grain_tab, improved_tab, compare_tab, calculator_tab = st.tabs([
+anchor_result = None
+anchor_error = None
+try:
+    anchor_result = fit_anchor_saturation_model(prepared_df)
+except Exception as exc:
+    anchor_error = str(exc)
+
+def enrich_real_point_metrics(result: FitResult, predictor) -> None:
+    params = result.params.set_index("Параметр модели")["Значение"].to_dict()
+    try:
+        temp = predictor(
+            params,
+            REAL_WORLD_POINT["D"],
+            REAL_WORLD_POINT["tau"],
+            REAL_WORLD_POINT["c_sigma"],
+            REAL_WORLD_POINT["G"],
+        )
+        result.metrics["Прогноз для реальной точки, °C"] = float(temp)
+        if REAL_WORLD_POINT["temp_min"] <= temp <= REAL_WORLD_POINT["temp_max"]:
+            result.metrics["Отклонение реальной точки от диапазона, °C"] = 0.0
+        elif temp < REAL_WORLD_POINT["temp_min"]:
+            result.metrics["Отклонение реальной точки от диапазона, °C"] = REAL_WORLD_POINT["temp_min"] - temp
+        else:
+            result.metrics["Отклонение реальной точки от диапазона, °C"] = temp - REAL_WORLD_POINT["temp_max"]
+    except Exception:
+        result.metrics["Прогноз для реальной точки, °C"] = np.nan
+        result.metrics["Отклонение реальной точки от диапазона, °C"] = np.nan
+
+
+if base_result is not None:
+    enrich_real_point_metrics(base_result, predict_temperature_engineering)
+if improved_result is not None:
+    enrich_real_point_metrics(improved_result, predict_temperature_improved)
+
+main_tab, grain_tab, improved_tab, anchor_tab, compare_tab, calculator_tab = st.tabs([
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
+    "Якорно-кинетическая модель",
     "Сравнение моделей",
     "Калькулятор",
 ])
@@ -880,13 +1133,38 @@ with improved_tab:
                     f"R²={best_grain['R²']:.4f}, RMSE={best_grain['RMSE, °C']:.4f} °C."
                 )
 
+with anchor_tab:
+    st.write(
+        "Новая модель учитывает два важных замечания: рост сигма-фазы замедляется при приближении к пределу 18%, "
+        "а очень важная реальная точка с τ=150000 ч используется как якорное ограничение по диапазону 570–600 °C. "
+        "Форма модели: 1/T = a + b·ln(D) + c·ln(τ) + d·G + e·ln(cσ/(18-cσ))."
+    )
+    try:
+        if anchor_result is None:
+            raise ValueError(anchor_error or "неизвестная ошибка")
+        show_result_block(
+            anchor_result,
+            key_prefix="anchor_all",
+            include_grain=True,
+            fit_function=fit_anchor_saturation_model,
+        )
+        st.info(
+            f"Прогноз для реальной точки (τ={REAL_WORLD_POINT['tau']:.0f} ч, D={REAL_WORLD_POINT['D']}, "
+            f"cσ={REAL_WORLD_POINT['c_sigma']}, G={REAL_WORLD_POINT['G']:.0f}) = "
+            f"{anchor_result.metrics.get('Прогноз для реальной точки, °C', np.nan):.4f} °C."
+        )
+    except Exception as exc:
+        st.error(f"Не удалось построить якорно-кинетическую модель: {exc}")
+
 with compare_tab:
     if base_result is None:
         st.error(f"Базовая модель недоступна для сравнения: {base_error}")
     elif improved_result is None:
         st.error(f"Улучшенная модель недоступна для сравнения: {improved_error}")
+    elif anchor_result is None:
+        st.error(f"Якорно-кинетическая модель недоступна для сравнения: {anchor_error}")
     else:
-        show_model_comparison(base_result, improved_result)
+        show_model_comparison(base_result, improved_result, anchor_result)
 
         grain_compare_rows: list[dict[str, float]] = []
         for grain in valid_grains:
@@ -894,15 +1172,19 @@ with compare_tab:
             try:
                 base_grain_result = fit_engineering_model(grain_df, include_grain=False)
                 improved_grain_result = fit_improved_model(grain_df, include_grain=False)
+                anchor_grain_result = fit_anchor_saturation_model(grain_df, include_grain=False)
                 grain_compare_rows.append(
                     {
                         "Номер зерна": grain,
                         "R² базовая": base_grain_result.metrics["R²"],
                         "R² улучшенная": improved_grain_result.metrics["R²"],
+                        "R² якорно-кинетическая": anchor_grain_result.metrics["R²"],
                         "RMSE базовая, °C": base_grain_result.metrics["RMSE, °C"],
                         "RMSE улучшенная, °C": improved_grain_result.metrics["RMSE, °C"],
+                        "RMSE якорно-кинетическая, °C": anchor_grain_result.metrics["RMSE, °C"],
                         "MAPE базовая, %": base_grain_result.metrics["MAPE, %"],
                         "MAPE улучшенная, %": improved_grain_result.metrics["MAPE, %"],
+                        "MAPE якорно-кинетическая, %": anchor_grain_result.metrics["MAPE, %"],
                     }
                 )
             except Exception:
@@ -918,5 +1200,7 @@ with calculator_tab:
         st.error(f"Калькулятор базовой модели недоступен: {base_error}")
     elif improved_result is None:
         st.error(f"Калькулятор улучшенной модели недоступен: {improved_error}")
+    elif anchor_result is None:
+        st.error(f"Калькулятор якорно-кинетической модели недоступен: {anchor_error}")
     else:
-        show_dual_calculator(base_result, improved_result)
+        show_multi_calculator(base_result, improved_result, anchor_result)
