@@ -1037,16 +1037,31 @@ def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
     if not result.outlier_recommendation.empty:
         st.warning("Ниже точки, которые система рекомендует проверить или временно исключить из подгонки sigma-модели.")
         outlier_labels = result.outlier_recommendation["point_id"].astype(str).tolist()
+        apply_key = f"applied_exclude_sigma_grain_{grain_value}"
+        widget_key = f"exclude_sigma_grain_{grain_value}"
+        if apply_key not in st.session_state:
+            st.session_state[apply_key] = list(outlier_labels)
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = list(st.session_state[apply_key])
         selected = st.multiselect(
             "Исключить точки из sigma-модели",
             options=result.data["point_id"].astype(str).tolist(),
-            default=outlier_labels,
-            key=f"exclude_sigma_grain_{grain_value}",
+            key=widget_key,
         )
-        if selected:
-            filtered = result.data[~result.data["point_id"].astype(str).isin(selected)].copy()
+        c_apply, c_reset = st.columns(2)
+        with c_apply:
+            if st.button("Применить исключение выбранных точек", key=f"apply_sigma_grain_{grain_value}"):
+                st.session_state[apply_key] = list(selected)
+        with c_reset:
+            if st.button("Сбросить исключения", key=f"reset_sigma_grain_{grain_value}"):
+                st.session_state[apply_key] = []
+                st.session_state[widget_key] = []
+        effective_selected = st.session_state.get(apply_key, [])
+        if effective_selected:
+            st.info(f"Сейчас реально исключено точек: {len(effective_selected)}")
+            filtered = result.data[~result.data["point_id"].astype(str).isin(effective_selected)].copy()
             if len(filtered) >= 7:
-                st.info(f"Пересчет sigma-модели после исключения {len(selected)} точек.")
+                st.info(f"Пересчет sigma-модели после исключения {len(effective_selected)} точек.")
                 recalculated = fit_anchor_saturation_model(filtered, include_grain=False)
                 st.subheader("Качество предсказания температуры после пересчета")
                 metric_cards(temperature_metric_summary(recalculated.data))
@@ -1154,7 +1169,7 @@ def build_cleaned_sigma_grain_results(prepared_df: pd.DataFrame, valid_grains: l
             result = fit_anchor_saturation_model(grain_df, include_grain=False)
         except Exception:
             continue
-        selected = st.session_state.get(f"exclude_sigma_grain_{grain}", [])
+        selected = st.session_state.get(f"applied_exclude_sigma_grain_{grain}", [])
         if selected:
             filtered = grain_df[~grain_df["point_id"].astype(str).isin(selected)].copy()
             if len(filtered) >= 7:
@@ -1164,6 +1179,20 @@ def build_cleaned_sigma_grain_results(prepared_df: pd.DataFrame, valid_grains: l
                     pass
         cleaned_results[grain] = result
     return cleaned_results
+
+
+def get_recommended_sigma_exclusions(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, list[str]]:
+    recommendations: dict[float, list[str]] = {}
+    for grain in valid_grains:
+        grain_df = prepared_df[prepared_df["G"] == grain].copy()
+        if len(grain_df) < 7:
+            continue
+        try:
+            result = fit_anchor_saturation_model(grain_df, include_grain=False)
+        except Exception:
+            continue
+        recommendations[grain] = result.outlier_recommendation["point_id"].astype(str).tolist()
+    return recommendations
 
 
 def get_recommended_diameter_exclusions(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, list[str]]:
@@ -1409,12 +1438,16 @@ def predict_temperature_sigma_universal(params: dict[str, float], tau: float, c_
 
 def evaluate_sigma_universal_model(params: dict[str, float], cleaned_results: dict[float, FitResult]) -> dict[str, float]:
     rows: list[dict[str, float]] = []
+    total_points = 0
+    total_models = 0
     for grain, result in cleaned_results.items():
         if float(grain) not in SIGMA_UNIVERSAL_GRAINS:
             continue
         grain_size = GRAIN_SIZE_MM.get(float(grain))
         if grain_size is None:
             continue
+        total_models += 1
+        total_points += int(result.metrics.get("Количество точек", len(result.data)))
         df = result.data.copy()
         df["T_pred_universal"] = df.apply(
             lambda row: predict_temperature_sigma_universal(params, float(row["tau"]), float(row["c_sigma"]), grain_size),
@@ -1426,7 +1459,8 @@ def evaluate_sigma_universal_model(params: dict[str, float], cleaned_results: di
     eval_df = pd.concat(rows, ignore_index=True)
     errors = eval_df["T"] - eval_df["T_pred_universal"]
     return {
-        "Количество точек": float(len(eval_df)),
+        "Количество точек": float(total_points),
+        "Количество зерновых моделей": float(total_models),
         "R² по T": float(r2_score(eval_df["T"], eval_df["T_pred_universal"])) if len(eval_df) >= 2 else np.nan,
         "RMSE по T, °C": float(np.sqrt(mean_squared_error(eval_df["T"], eval_df["T_pred_universal"]))),
         "MAE по T, °C": float(mean_absolute_error(eval_df["T"], eval_df["T_pred_universal"])),
@@ -1436,10 +1470,14 @@ def evaluate_sigma_universal_model(params: dict[str, float], cleaned_results: di
 
 def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results: dict[float, FitResult]) -> dict[str, float]:
     rows: list[pd.DataFrame] = []
+    total_points = 0
+    total_models = 0
     for grain, result in cleaned_results.items():
         grain_size = GRAIN_SIZE_MM.get(float(grain))
         if grain_size is None:
             continue
+        total_models += 1
+        total_points += int(result.metrics.get("Количество точек", len(result.data)))
         df = result.data.copy()
         df["T_pred_universal"] = df.apply(
             lambda row: predict_temperature_diameter_universal(params, float(row["D"]), float(row["tau"]), grain_size),
@@ -1451,7 +1489,8 @@ def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results:
     eval_df = pd.concat(rows, ignore_index=True)
     errors = eval_df["T"] - eval_df["T_pred_universal"]
     return {
-        "Количество точек": float(len(eval_df)),
+        "Количество точек": float(total_points),
+        "Количество зерновых моделей": float(total_models),
         "R² по T": float(r2_score(eval_df["T"], eval_df["T_pred_universal"])) if len(eval_df) >= 2 else np.nan,
         "RMSE по T, °C": float(np.sqrt(mean_squared_error(eval_df["T"], eval_df["T_pred_universal"]))),
         "MAE по T, °C": float(mean_absolute_error(eval_df["T"], eval_df["T_pred_universal"])),
@@ -1690,11 +1729,11 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
 
     try:
         cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
-        params_item, coeff_df_item, summary_item = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="m_const_median")
+        params_item, coeff_df_item, summary_item = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="quadratic_full")
         eval_item = evaluate_sigma_universal_model(params_item, cleaned_sigma_results)
         selected_sigma_variant = {
-            "key": "m_const_median",
-            "title": "A(dg), p(dg), m=const (медиана)",
+            "key": "quadratic_full",
+            "title": "log(A)(dg), p(dg), m(dg) = u0 + u1·ln(dg) + u2·[ln(dg)]²",
             "params": params_item,
             "coeff_df": coeff_df_item,
             "summary": summary_item,
@@ -1771,9 +1810,9 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 "\n".join(
                     [
                         "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)",
-                        f"log(A)(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg)",
-                        f"p(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg)",
-                        f"m(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg)",
+                        f"log(A)(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg) + ({p['alpha2']:.8f}) · [ln(dg)]²",
+                        f"p(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg) + ({p['beta2']:.8f}) · [ln(dg)]²",
+                        f"m(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg) + ({p['gamma2']:.8f}) · [ln(dg)]²",
                     ]
                 ),
                 language="text",
@@ -2289,49 +2328,104 @@ with anchor_tab:
     if not valid_grains:
         st.warning("Для отдельных номеров зерна пока недостаточно точек. Нужно минимум 7 точек на номер зерна.")
     else:
-        selected_sigma_grain = st.selectbox("Выберите номер зерна для sigma-модели", valid_grains)
-        for grain in valid_grains:
-            grain_df = prepared_df[prepared_df["G"] == grain].copy()
-            try:
-                grain_result = fit_anchor_saturation_model(grain_df, include_grain=False)
-                sigma_metrics = sigma_metric_summary(grain_result.data)
-                sigma_grain_scores.append(
+        local_tab, universal_tab = st.tabs(["Модели по отдельным зернам", "Универсальная модель"])
+        with local_tab:
+            cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
+            selected_sigma_grain = st.selectbox("Выберите номер зерна для sigma-модели", valid_grains)
+            for grain in valid_grains:
+                grain_df = prepared_df[prepared_df["G"] == grain].copy()
+                try:
+                    grain_result = cleaned_sigma_results.get(grain) or fit_anchor_saturation_model(grain_df, include_grain=False)
+                    sigma_metrics = sigma_metric_summary(grain_result.data)
+                    sigma_grain_scores.append(
+                        {
+                            "Номер зерна": grain,
+                            "Количество точек": grain_result.metrics["Количество точек"],
+                            **sigma_metrics,
+                        }
+                    )
+                    if grain == selected_sigma_grain:
+                        show_sigma_grain_block(grain_result, grain)
+                except Exception:
+                    continue
+
+            if sigma_grain_scores:
+                st.subheader("Сравнение sigma-моделей по номерам зерна")
+                sigma_score_df = pd.DataFrame(sigma_grain_scores).sort_values(
+                    by=["R² по cσ", "RMSE по cσ, %", "MAPE по cσ, %"],
+                    ascending=[False, True, True],
+                )
+                st.dataframe(sigma_score_df, use_container_width=True, hide_index=True)
+                best_sigma_grain = sigma_score_df.iloc[0]
+                st.info(
+                    f"Лучше всего sigma-модель сейчас выглядит для номера зерна {best_sigma_grain['Номер зерна']}: "
+                    f"R² по cσ={best_sigma_grain['R² по cσ']:.4f}, RMSE по cσ={best_sigma_grain['RMSE по cσ, %']:.4f} %"
+                )
+
+        with universal_tab:
+            recommended_exclusions = get_recommended_sigma_exclusions(prepared_df, valid_grains)
+            c_apply_all, c_reset_all = st.columns(2)
+            with c_apply_all:
+                if st.button("Применить все рекомендованные исключения по всем зернам sigma", key="apply_all_sigma_exclusions"):
+                    for grain, labels in recommended_exclusions.items():
+                        st.session_state[f"applied_exclude_sigma_grain_{grain}"] = list(labels)
+                        st.session_state[f"exclude_sigma_grain_{grain}"] = list(labels)
+            with c_reset_all:
+                if st.button("Сбросить все исключения по sigma-модели", key="reset_all_sigma_exclusions"):
+                    for grain in valid_grains:
+                        st.session_state[f"applied_exclude_sigma_grain_{grain}"] = []
+                        st.session_state[f"exclude_sigma_grain_{grain}"] = []
+
+            active_rows = []
+            for grain in valid_grains:
+                active_rows.append(
                     {
                         "Номер зерна": grain,
-                        **sigma_metrics,
+                        "Рекомендовано исключить": len(recommended_exclusions.get(grain, [])),
+                        "Сейчас исключено": len(st.session_state.get(f"applied_exclude_sigma_grain_{grain}", [])),
                     }
                 )
-                if grain == selected_sigma_grain:
-                    show_sigma_grain_block(grain_result, grain)
-            except Exception:
-                continue
+            st.dataframe(pd.DataFrame(active_rows), use_container_width=True, hide_index=True)
 
-        if sigma_grain_scores:
-            st.subheader("Сравнение sigma-моделей по номерам зерна")
-            sigma_score_df = pd.DataFrame(sigma_grain_scores).sort_values(
-                by=["R² по cσ", "RMSE по cσ, %", "MAPE по cσ, %"],
-                ascending=[False, True, True],
+            st.subheader("Универсальная sigma-модель по размеру зерна")
+            st.write(
+                "Подход повторяет универсальную модель роста диаметра: сначала строятся отдельные sigma-модели "
+                "для каждого номера зерна, затем коэффициенты log(A), p и m выражаются через размер зерна. "
+                "В общую sigma-модель включены все пять доступных зерен: 3, 5, 8, 9 и 10."
             )
-            st.dataframe(sigma_score_df, use_container_width=True, hide_index=True)
-            best_sigma_grain = sigma_score_df.iloc[0]
-            st.info(
-                f"Лучше всего sigma-модель сейчас выглядит для номера зерна {best_sigma_grain['Номер зерна']}: "
-                f"R² по cσ={best_sigma_grain['R² по cσ']:.4f}, RMSE по cσ={best_sigma_grain['RMSE по cσ, %']:.4f} %"
-            )
+            try:
+                cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
+                sigma_coeff_all = build_sigma_coefficient_df(cleaned_sigma_results, allowed_grains=valid_grains)
+                if not sigma_coeff_all.empty:
+                    st.markdown("**Сначала — обзор коэффициентов по всем доступным номерам зерна, уже по очищенным локальным sigma-моделям.**")
+                    coeff_all_view = sigma_coeff_all[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].rename(
+                        columns={
+                            "grain_size_mm": "Размер зерна, мм",
+                            "log_a": "log(A)",
+                            "p_exp": "p",
+                            "m_exp": "m",
+                            "R²": "R² по T",
+                            "RMSE_sigma": "RMSE по cσ, %",
+                        }
+                    )
+                    st.dataframe(coeff_all_view, use_container_width=True, hide_index=True)
+                    st.subheader("Сравнение 4 форм аппроксимации коэффициентов sigma-модели")
+                    analysis_log_a = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"log_a": "a"}), "a").assign(**{"Коэффициент": "log(A)"})
+                    analysis_p = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"p_exp": "a"}), "a").assign(**{"Коэффициент": "p"})
+                    analysis_m = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"m_exp": "a"}), "a").assign(**{"Коэффициент": "m"})
+                    tab_a_all, tab_p_all, tab_m_all = st.tabs(["Коэффициент log(A)", "Коэффициент p", "Коэффициент m"])
+                    with tab_a_all:
+                        st.dataframe(analysis_log_a, use_container_width=True, hide_index=True)
+                    with tab_p_all:
+                        st.dataframe(analysis_p, use_container_width=True, hide_index=True)
+                    with tab_m_all:
+                        st.dataframe(analysis_m, use_container_width=True, hide_index=True)
 
-        st.subheader("Универсальная sigma-модель по размеру зерна")
-        st.write(
-            "Подход повторяет универсальную модель роста диаметра: сначала строятся отдельные sigma-модели "
-            "для каждого номера зерна, затем коэффициенты log(A) и p выражаются через логарифм среднего размера зерна. "
-            "В общую sigma-модель включены все пять доступных зерен: 3, 5, 8, 9 и 10. Коэффициент m фиксирован как константа по медиане, "
-            "а зависимости для log(A) и p подбираются по этим пяти зерновым моделям."
-        )
-        try:
-            cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
-            sigma_coeff_all = build_sigma_coefficient_df(cleaned_sigma_results, allowed_grains=valid_grains)
-            if not sigma_coeff_all.empty:
-                st.markdown("**Сначала — обзор коэффициентов по всем доступным номерам зерна, уже по очищенным локальным sigma-моделям.**")
-                coeff_all_view = sigma_coeff_all[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].rename(
+                selected_params, sigma_coeff_df, sigma_summary = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="quadratic_full")
+                sigma_eval = evaluate_sigma_universal_model(selected_params, cleaned_sigma_results)
+
+                coeff_view = sigma_coeff_df[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].copy()
+                coeff_view = coeff_view.rename(
                     columns={
                         "grain_size_mm": "Размер зерна, мм",
                         "log_a": "log(A)",
@@ -2341,110 +2435,84 @@ with anchor_tab:
                         "RMSE_sigma": "RMSE по cσ, %",
                     }
                 )
-                st.dataframe(coeff_all_view, use_container_width=True, hide_index=True)
-                st.subheader("Сравнение 4 форм аппроксимации коэффициентов sigma-модели")
-                analysis_log_a = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"log_a": "a"}), "a").assign(**{"Коэффициент": "log(A)"})
-                analysis_p = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"p_exp": "a"}), "a").assign(**{"Коэффициент": "p"})
-                analysis_m = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"m_exp": "a"}), "a").assign(**{"Коэффициент": "m"})
-                tab_a_all, tab_p_all, tab_m_all = st.tabs(["Коэффициент log(A)", "Коэффициент p", "Коэффициент m"])
-                with tab_a_all:
-                    st.dataframe(analysis_log_a, use_container_width=True, hide_index=True)
-                with tab_p_all:
-                    st.dataframe(analysis_p, use_container_width=True, hide_index=True)
-                with tab_m_all:
-                    st.dataframe(analysis_m, use_container_width=True, hide_index=True)
+                st.dataframe(coeff_view, use_container_width=True, hide_index=True)
 
-            selected_params, sigma_coeff_df, sigma_summary = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="quadratic_full")
-            sigma_eval = evaluate_sigma_universal_model(selected_params, cleaned_sigma_results)
+                st.info(
+                    f"Для общей sigma-модели используются все пять зерен: 3, 5, 8, 9, 10, причем коэффициенты берутся из очищенных локальных sigma-моделей. "
+                    f"Текущий вариант: для log(A), p и m используется форма u0 + u1·ln(dg) + u2·[ln(dg)]². "
+                    f"RMSE={sigma_eval['RMSE по T, °C']:.4f} °C, R²={sigma_eval['R² по T']:.4f}."
+                )
 
-            coeff_view = sigma_coeff_df[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].copy()
-            coeff_view = coeff_view.rename(
-                columns={
-                    "grain_size_mm": "Размер зерна, мм",
-                    "log_a": "log(A)",
-                    "p_exp": "p",
-                    "m_exp": "m",
-                    "R²": "R² по T",
-                    "RMSE_sigma": "RMSE по cσ, %",
-                }
-            )
-            st.dataframe(coeff_view, use_container_width=True, hide_index=True)
-
-            st.info(
-                f"Для общей sigma-модели используются все пять зерен: 3, 5, 8, 9, 10, причем коэффициенты берутся из очищенных локальных sigma-моделей. "
-                f"Текущий вариант: для log(A), p и m используется форма u0 + u1·ln(dg) + u2·[ln(dg)]². "
-                f"RMSE={sigma_eval['RMSE по T, °C']:.4f} °C, R²={sigma_eval['R² по T']:.4f}."
-            )
-
-            st.code(
-                "\n".join(
+                st.code(
+                    "\n".join(
+                        [
+                            f"log(A)(dg) = {selected_params['alpha0']:.8f} + ({selected_params['alpha1']:.8f}) · ln(dg) + ({selected_params['alpha2']:.8f}) · [ln(dg)]²",
+                            f"p(dg) = {selected_params['beta0']:.8f} + ({selected_params['beta1']:.8f}) · ln(dg) + ({selected_params['beta2']:.8f}) · [ln(dg)]²",
+                            f"m(dg) = {selected_params['gamma0']:.8f} + ({selected_params['gamma1']:.8f}) · ln(dg) + ({selected_params['gamma2']:.8f}) · [ln(dg)]²",
+                            "",
+                            "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)",
+                        ]
+                    ),
+                    language="text",
+                )
+                meta_quality_df = pd.DataFrame(
                     [
-                        f"log(A)(dg) = {selected_params['alpha0']:.8f} + ({selected_params['alpha1']:.8f}) · ln(dg) + ({selected_params['alpha2']:.8f}) · [ln(dg)]²",
-                        f"p(dg) = {selected_params['beta0']:.8f} + ({selected_params['beta1']:.8f}) · ln(dg) + ({selected_params['beta2']:.8f}) · [ln(dg)]²",
-                        f"m(dg) = {selected_params['gamma0']:.8f} + ({selected_params['gamma1']:.8f}) · ln(dg) + ({selected_params['gamma2']:.8f}) · [ln(dg)]²",
-                        "",
-                        "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)",
+                        {
+                            "R² для log(A)(dg)": selected_params["r2_log_a"],
+                            "R² для p(dg)": selected_params["r2_p"],
+                            "R² для m(dg)": selected_params["r2_m"],
+                            "R² по T": sigma_eval["R² по T"],
+                            "RMSE по T, °C": sigma_eval["RMSE по T, °C"],
+                            "Количество зерновых моделей": sigma_eval["Количество зерновых моделей"],
+                            "Количество точек": sigma_eval["Количество точек"],
+                        }
                     ]
-                ),
-                language="text",
-            )
-            meta_quality_df = pd.DataFrame(
-                [
-                    {
-                        "R² для log(A)(dg)": selected_params["r2_log_a"],
-                        "R² для p(dg)": selected_params["r2_p"],
-                        "R² для m(dg)": selected_params["r2_m"],
-                        "R² по T": sigma_eval["R² по T"],
-                        "RMSE по T, °C": sigma_eval["RMSE по T, °C"],
-                        "Количество зерновых моделей": float(len(sigma_coeff_df)),
-                    }
-                ]
-            )
-            st.dataframe(meta_quality_df, use_container_width=True, hide_index=True)
-            with st.expander("Сводка по универсальной sigma-модели"):
-                st.text(sigma_summary)
+                )
+                st.dataframe(meta_quality_df, use_container_width=True, hide_index=True)
+                with st.expander("Сводка по универсальной sigma-модели"):
+                    st.text(sigma_summary)
 
-            st.subheader("Калькулятор температуры по универсальной sigma-модели")
-            with st.form(key="sigma_universal_form"):
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    sigma_tau_value = st.number_input(
-                        "Время наработки τ для универсальной sigma-модели",
-                        min_value=1.0,
-                        value=1000.0,
-                        step=1.0,
-                        format="%.0f",
-                        key="sigma_universal_tau",
-                    )
-                with c2:
-                    sigma_value = st.number_input(
-                        "Содержание сигма-фазы cσ для универсальной модели, %",
-                        min_value=0.01,
-                        value=1.0,
-                        step=0.01,
-                        format="%.2f",
-                        key="sigma_universal_sigma",
-                    )
-                with c3:
-                    sigma_grain_number = st.selectbox(
-                        "Номер зерна для универсальной sigma-модели",
-                        sorted(GRAIN_SIZE_MM.keys()),
-                        key="sigma_universal_grain",
-                    )
-                submitted = st.form_submit_button("Рассчитать")
-            if submitted:
-                try:
-                    sigma_temp_value = predict_temperature_sigma_universal(
-                        selected_params,
-                        sigma_tau_value,
-                        sigma_value,
-                        GRAIN_SIZE_MM[float(sigma_grain_number)],
-                    )
-                    st.metric("Расчетная температура по универсальной sigma-модели, °C", f"{sigma_temp_value:.4f}")
-                except Exception as exc:
-                    st.error(f"Не удалось выполнить расчет по универсальной sigma-модели: {exc}")
-        except Exception as exc:
-            st.error(f"Не удалось собрать универсальную sigma-модель по размеру зерна: {exc}")
+                st.subheader("Калькулятор температуры по универсальной sigma-модели")
+                with st.form(key="sigma_universal_form"):
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        sigma_tau_value = st.number_input(
+                            "Время наработки τ для универсальной sigma-модели",
+                            min_value=1.0,
+                            value=1000.0,
+                            step=1.0,
+                            format="%.0f",
+                            key="sigma_universal_tau",
+                        )
+                    with c2:
+                        sigma_value = st.number_input(
+                            "Содержание сигма-фазы cσ для универсальной модели, %",
+                            min_value=0.01,
+                            value=1.0,
+                            step=0.01,
+                            format="%.2f",
+                            key="sigma_universal_sigma",
+                        )
+                    with c3:
+                        sigma_grain_number = st.selectbox(
+                            "Номер зерна для универсальной sigma-модели",
+                            sorted(GRAIN_SIZE_MM.keys()),
+                            key="sigma_universal_grain",
+                        )
+                    submitted = st.form_submit_button("Рассчитать")
+                if submitted:
+                    try:
+                        sigma_temp_value = predict_temperature_sigma_universal(
+                            selected_params,
+                            sigma_tau_value,
+                            sigma_value,
+                            GRAIN_SIZE_MM[float(sigma_grain_number)],
+                        )
+                        st.metric("Расчетная температура по универсальной sigma-модели, °C", f"{sigma_temp_value:.4f}")
+                    except Exception as exc:
+                        st.error(f"Не удалось выполнить расчет по универсальной sigma-модели: {exc}")
+            except Exception as exc:
+                st.error(f"Не удалось собрать универсальную sigma-модель по размеру зерна: {exc}")
 
 with compare_tab:
     if base_result is None:
