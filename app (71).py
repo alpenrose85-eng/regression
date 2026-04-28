@@ -87,7 +87,7 @@ GRAIN_SIZE_MM = {
     10.0: 0.011,
 }
 
-SIGMA_UNIVERSAL_GRAINS = [8.0, 9.0, 10.0]
+SIGMA_UNIVERSAL_GRAINS = [5.0, 8.0, 9.0, 10.0]
 
 
 @dataclass
@@ -1230,10 +1230,22 @@ def fit_sigma_universal_grain_size_model(
         )
     coeff_df = pd.DataFrame(rows).dropna()
     if len(coeff_df) < 3:
-        raise ValueError("Для универсальной sigma-модели по зернам 8, 9 и 10 нужны 3 очищенные зерновые модели с известным размером зерна.")
+        raise ValueError("Для универсальной sigma-модели нужны минимум 3 очищенные зерновые модели с известным размером зерна.")
 
     X = sm.add_constant(coeff_df[["ln_grain_size"]])
     model_log_a = sm.OLS(coeff_df["log_a"], X).fit()
+
+    weights = 1.0 / np.maximum(coeff_df["RMSE_sigma"].to_numpy(dtype=float), 1e-9)
+
+    def aggregate_const(series: pd.Series, mode: str) -> float:
+        values = series.to_numpy(dtype=float)
+        if mode == "mean":
+            return float(np.mean(values))
+        if mode == "median":
+            return float(np.median(values))
+        if mode == "weighted":
+            return float(np.average(values, weights=weights))
+        raise ValueError(f"Неизвестный режим константы: {mode}")
 
     if variant == "full":
         model_p = sm.OLS(coeff_df["p_exp"], X).fit()
@@ -1243,22 +1255,30 @@ def fit_sigma_universal_grain_size_model(
         gamma0 = float(model_m.params.get("const", np.nan))
         gamma1 = float(model_m.params.get("ln_grain_size", np.nan))
         variant_label = "A(dg), p(dg), m(dg)"
-    elif variant == "m_const":
+    elif variant == "m_const_mean":
         model_p = sm.OLS(coeff_df["p_exp"], X).fit()
         model_m = None
         beta0 = float(model_p.params.get("const", np.nan))
         beta1 = float(model_p.params.get("ln_grain_size", np.nan))
-        gamma0 = float(coeff_df["m_exp"].mean())
+        gamma0 = aggregate_const(coeff_df["m_exp"], "mean")
         gamma1 = 0.0
-        variant_label = "A(dg), p(dg), m=const"
-    elif variant == "p_m_const":
-        model_p = None
+        variant_label = "A(dg), p(dg), m=const (среднее)"
+    elif variant == "m_const_median":
+        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
         model_m = None
-        beta0 = float(coeff_df["p_exp"].mean())
-        beta1 = 0.0
-        gamma0 = float(coeff_df["m_exp"].mean())
+        beta0 = float(model_p.params.get("const", np.nan))
+        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
+        gamma0 = aggregate_const(coeff_df["m_exp"], "median")
         gamma1 = 0.0
-        variant_label = "A(dg), p=const, m=const"
+        variant_label = "A(dg), p(dg), m=const (медиана)"
+    elif variant == "m_const_weighted":
+        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
+        model_m = None
+        beta0 = float(model_p.params.get("const", np.nan))
+        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
+        gamma0 = aggregate_const(coeff_df["m_exp"], "weighted")
+        gamma1 = 0.0
+        variant_label = "A(dg), p(dg), m=const (взвешенное)"
     else:
         raise ValueError(f"Неизвестный вариант sigma-метамодели: {variant}")
 
@@ -1277,8 +1297,9 @@ def fit_sigma_universal_grain_size_model(
     }
     p_text = f"p(dg)=beta0+beta1·ln(dg), R²={model_p.rsquared:.4f}" if model_p is not None and beta1 != 0.0 else f"p=const={beta0:.8f}"
     m_text = f"m(dg)=gamma0+gamma1·ln(dg), R²={model_m.rsquared:.4f}" if model_m is not None and gamma1 != 0.0 else f"m=const={gamma0:.8f}"
+    included_grains = ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in coeff_df["G"].tolist())
     summary_text = (
-        f"Метамодель коэффициентов очищенных sigma-моделей по размеру зерна только для зерен 8, 9 и 10. Вариант: {variant_label}.\n\n"
+        f"Метамодель коэффициентов очищенных sigma-моделей по размеру зерна. Использованы зерна: {included_grains}. Вариант: {variant_label}.\n\n"
         f"log(A)(dg)=alpha0+alpha1·ln(dg), R²={model_log_a.rsquared:.4f}\n"
         f"{p_text}\n"
         f"{m_text}\n\n"
@@ -1991,14 +2012,16 @@ with anchor_tab:
         st.write(
             "Подход повторяет универсальную модель роста диаметра: сначала строятся отдельные sigma-модели "
             "для каждого номера зерна, затем коэффициенты log(A), p и m выражаются через логарифм среднего размера зерна. "
-            "В этой версии для метамодели используются только зерна 8, 9 и 10, потому что модели для 3 и 5 оказались слабее."
+            "В этой версии для метамодели используются зерна 5, 8, 9 и 10. Для сравнения оставлены 4 варианта, "
+            "чтобы проверить, стоит ли фиксировать коэффициент m через среднее, медиану или взвешенное среднее."
         )
         try:
             cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
             sigma_variants = [
                 ("full", "Версия 1: A(dg), p(dg), m(dg)"),
-                ("m_const", "Версия 2: A(dg), p(dg), m=const"),
-                ("p_m_const", "Версия 3: A(dg), p=const, m=const"),
+                ("m_const_mean", "Версия 2: A(dg), p(dg), m=const (среднее)"),
+                ("m_const_median", "Версия 3: A(dg), p(dg), m=const (медиана)"),
+                ("m_const_weighted", "Версия 4: A(dg), p(dg), m=const (взвешенное)"),
             ]
             variant_results = []
             sigma_coeff_df = None
