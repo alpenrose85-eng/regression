@@ -1229,6 +1229,49 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
     return params, coeff_df, summary_text
 
 
+def analyze_coefficient_forms(coeff_df: pd.DataFrame, coeff_name: str) -> pd.DataFrame:
+    source = coeff_df[["G", "grain_size_mm", "ln_grain_size", coeff_name]].dropna().copy()
+    y = source[coeff_name].to_numpy(dtype=float)
+    dg = source["grain_size_mm"].to_numpy(dtype=float)
+    ln_dg = source["ln_grain_size"].to_numpy(dtype=float)
+
+    candidates = [
+        (
+            "u0 + u1·ln(dg)",
+            np.column_stack([np.ones(len(source)), ln_dg]),
+            ["u0", "u1"],
+        ),
+        (
+            "u0 + u1·dg",
+            np.column_stack([np.ones(len(source)), dg]),
+            ["u0", "u1"],
+        ),
+        (
+            "u0 + u1·(1/dg)",
+            np.column_stack([np.ones(len(source)), 1.0 / dg]),
+            ["u0", "u1"],
+        ),
+        (
+            "u0 + u1·ln(dg) + u2·[ln(dg)]²",
+            np.column_stack([np.ones(len(source)), ln_dg, ln_dg ** 2]),
+            ["u0", "u1", "u2"],
+        ),
+    ]
+
+    rows: list[dict[str, float | str]] = []
+    for label, X, names in candidates:
+        model = sm.OLS(y, X).fit()
+        row: dict[str, float | str] = {
+            "Коэффициент": coeff_name,
+            "Форма": label,
+            "R²": float(model.rsquared),
+        }
+        for idx, name in enumerate(names):
+            row[name] = float(model.params[idx])
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(by=["R²", "Форма"], ascending=[False, True]).reset_index(drop=True)
+
+
 def fit_sigma_universal_grain_size_model(
     cleaned_results: dict[float, FitResult],
     variant: str = "full",
@@ -1631,11 +1674,17 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
         universal_diameter_params, diameter_coeff_df, diameter_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
         diameter_eval = evaluate_diameter_universal_model(universal_diameter_params, cleaned_diameter_results)
+        diameter_analysis_a = analyze_coefficient_forms(diameter_coeff_df, "a")
+        diameter_analysis_b = analyze_coefficient_forms(diameter_coeff_df, "b")
+        diameter_analysis_c = analyze_coefficient_forms(diameter_coeff_df, "c")
         diameter_payload = {
             "params": universal_diameter_params,
             "coeff_df": diameter_coeff_df,
             "summary": diameter_summary,
             "eval": diameter_eval,
+            "analysis_a": diameter_analysis_a,
+            "analysis_b": diameter_analysis_b,
+            "analysis_c": diameter_analysis_c,
         }
     except Exception as exc:
         diameter_error_local = str(exc)
@@ -1704,6 +1753,14 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
             )
             with st.expander("Сводка по универсальной модели диаметра"):
                 st.text(diameter_payload["summary"])
+            with st.expander("Сравнение 4 форм для коэффициентов a, b, c"):
+                tab_a, tab_b, tab_c = st.tabs(["Коэффициент a", "Коэффициент b", "Коэффициент c"])
+                with tab_a:
+                    st.dataframe(diameter_payload["analysis_a"], use_container_width=True, hide_index=True)
+                with tab_b:
+                    st.dataframe(diameter_payload["analysis_b"], use_container_width=True, hide_index=True)
+                with tab_c:
+                    st.dataframe(diameter_payload["analysis_c"], use_container_width=True, hide_index=True)
 
     with col_right:
         st.subheader("Формула универсальной sigma-модели")
@@ -2180,6 +2237,9 @@ with diameter_tab:
             st.subheader("Универсальная модель по размеру зерна")
             try:
                 universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
+                coeff_analysis_a = analyze_coefficient_forms(coeff_df, "a")
+                coeff_analysis_b = analyze_coefficient_forms(coeff_df, "b")
+                coeff_analysis_c = analyze_coefficient_forms(coeff_df, "c")
                 formula_text = (
                     "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))\n"
                     "a(dg) = alpha0 + alpha1·ln(dg)\n"
@@ -2191,6 +2251,14 @@ with diameter_tab:
                 )
                 st.code(formula_text, language="text")
                 st.dataframe(coeff_df, use_container_width=True, hide_index=True)
+                st.subheader("Сравнение 4 форм зависимости коэффициентов от размера зерна")
+                tab_a, tab_b, tab_c = st.tabs(["Коэффициент a", "Коэффициент b", "Коэффициент c"])
+                with tab_a:
+                    st.dataframe(coeff_analysis_a, use_container_width=True, hide_index=True)
+                with tab_b:
+                    st.dataframe(coeff_analysis_b, use_container_width=True, hide_index=True)
+                with tab_c:
+                    st.dataframe(coeff_analysis_c, use_container_width=True, hide_index=True)
                 with st.expander("Сводка по универсальной модели"):
                     st.text(universal_summary)
 
