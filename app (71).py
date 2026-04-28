@@ -1202,18 +1202,22 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
     if len(coeff_df) < 3:
         raise ValueError("Для универсальной модели нужно минимум 3 очищенные зерновые модели с известным размером зерна.")
 
-    X = sm.add_constant(coeff_df[["ln_grain_size"]])
+    ln_g = coeff_df["ln_grain_size"].to_numpy(dtype=float)
+    X = np.column_stack([np.ones(len(coeff_df)), ln_g, ln_g ** 2])
     model_a = sm.OLS(coeff_df["a"], X).fit()
     model_b = sm.OLS(coeff_df["b"], X).fit()
     model_c = sm.OLS(coeff_df["c"], X).fit()
 
     params = {
-        "alpha0": float(model_a.params.get("const", np.nan)),
-        "alpha1": float(model_a.params.get("ln_grain_size", np.nan)),
-        "beta0": float(model_b.params.get("const", np.nan)),
-        "beta1": float(model_b.params.get("ln_grain_size", np.nan)),
-        "gamma0": float(model_c.params.get("const", np.nan)),
-        "gamma1": float(model_c.params.get("ln_grain_size", np.nan)),
+        "alpha0": float(model_a.params[0]),
+        "alpha1": float(model_a.params[1]),
+        "alpha2": float(model_a.params[2]),
+        "beta0": float(model_b.params[0]),
+        "beta1": float(model_b.params[1]),
+        "beta2": float(model_b.params[2]),
+        "gamma0": float(model_c.params[0]),
+        "gamma1": float(model_c.params[1]),
+        "gamma2": float(model_c.params[2]),
         "r2_a": float(model_a.rsquared),
         "r2_b": float(model_b.rsquared),
         "r2_c": float(model_c.rsquared),
@@ -1221,9 +1225,9 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
     included_grains = ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in coeff_df["G"].tolist())
     summary_text = (
         "Метамодель коэффициентов очищенных зерновых моделей по размеру зерна.\n\n"
-        f"a(dg)=alpha0+alpha1·ln(dg), R²={model_a.rsquared:.4f}\n"
-        f"b(dg)=beta0+beta1·ln(dg), R²={model_b.rsquared:.4f}\n"
-        f"c(dg)=gamma0+gamma1·ln(dg), R²={model_c.rsquared:.4f}\n"
+        f"a(dg)=alpha0+alpha1·ln(dg)+alpha2·[ln(dg)]², R²={model_a.rsquared:.4f}\n"
+        f"b(dg)=beta0+beta1·ln(dg)+beta2·[ln(dg)]², R²={model_b.rsquared:.4f}\n"
+        f"c(dg)=gamma0+gamma1·ln(dg)+gamma2·[ln(dg)]², R²={model_c.rsquared:.4f}\n"
         f"Использованы все зерна: {included_grains}"
     )
     return params, coeff_df, summary_text
@@ -1379,9 +1383,9 @@ def fit_sigma_universal_grain_size_model(
 
 def predict_temperature_diameter_universal(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
     ln_g = np.log(grain_size_mm)
-    a_val = params["alpha0"] + params["alpha1"] * ln_g
-    b_val = params["beta0"] + params["beta1"] * ln_g
-    c_val = params["gamma0"] + params["gamma1"] * ln_g
+    a_val = params["alpha0"] + params["alpha1"] * ln_g + params["alpha2"] * (ln_g ** 2)
+    b_val = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
+    c_val = params["gamma0"] + params["gamma1"] * ln_g + params["gamma2"] * (ln_g ** 2)
     if not np.isfinite(c_val) or abs(c_val) < 1e-12:
         raise ValueError("Универсальная модель дала слишком малый коэффициент при 1/T.")
     inv_t = (np.log(D) - a_val - b_val * np.log(tau)) / c_val
@@ -1744,9 +1748,9 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 "\n".join(
                     [
                         "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))",
-                        f"a(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg)",
-                        f"b(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg)",
-                        f"c(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg)",
+                        f"a(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg) + ({p['alpha2']:.8f}) · [ln(dg)]²",
+                        f"b(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg) + ({p['beta2']:.8f}) · [ln(dg)]²",
+                        f"c(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg) + ({p['gamma2']:.8f}) · [ln(dg)]²",
                     ]
                 ),
                 language="text",
@@ -2242,12 +2246,12 @@ with diameter_tab:
                 coeff_analysis_c = analyze_coefficient_forms(coeff_df, "c")
                 formula_text = (
                     "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))\n"
-                    "a(dg) = alpha0 + alpha1·ln(dg)\n"
-                    "b(dg) = beta0 + beta1·ln(dg)\n"
-                    "c(dg) = gamma0 + gamma1·ln(dg)\n"
-                    f"alpha0 = {universal_params['alpha0']:.8f}, alpha1 = {universal_params['alpha1']:.8f}\n"
-                    f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}\n"
-                    f"gamma0 = {universal_params['gamma0']:.8f}, gamma1 = {universal_params['gamma1']:.8f}"
+                    "a(dg) = alpha0 + alpha1·ln(dg) + alpha2·[ln(dg)]²\n"
+                    "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²\n"
+                    "c(dg) = gamma0 + gamma1·ln(dg) + gamma2·[ln(dg)]²\n"
+                    f"alpha0 = {universal_params['alpha0']:.8f}, alpha1 = {universal_params['alpha1']:.8f}, alpha2 = {universal_params['alpha2']:.8f}\n"
+                    f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}, beta2 = {universal_params['beta2']:.8f}\n"
+                    f"gamma0 = {universal_params['gamma0']:.8f}, gamma1 = {universal_params['gamma1']:.8f}, gamma2 = {universal_params['gamma2']:.8f}"
                 )
                 st.code(formula_text, language="text")
                 st.dataframe(coeff_df, use_container_width=True, hide_index=True)
