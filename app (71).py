@@ -991,21 +991,73 @@ def sigma_temperature_points_plot(df: pd.DataFrame, title: str) -> None:
     plt.close(fig)
 
 
-def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
+def show_sigma_grain_block(result: FitResult, grain_value: float, grain_df: pd.DataFrame) -> None:
+    apply_key = f"applied_exclude_sigma_grain_{grain_value}"
+    widget_key = f"exclude_sigma_grain_{grain_value}"
+    source_point_ids = grain_df["point_id"].astype(str).tolist()
+    recommended_ids = result.outlier_recommendation["point_id"].astype(str).tolist()
+
+    if apply_key not in st.session_state:
+        st.session_state[apply_key] = []
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = list(st.session_state[apply_key])
+
+    active_result = result
+    effective_selected = [pid for pid in st.session_state.get(apply_key, []) if pid in source_point_ids]
+    if effective_selected:
+        filtered = grain_df[~grain_df["point_id"].astype(str).isin(effective_selected)].copy()
+        if len(filtered) >= 7:
+            try:
+                active_result = fit_anchor_saturation_model(filtered, include_grain=False)
+            except Exception:
+                active_result = result
+
     st.subheader(f"Sigma-модель для номера зерна {grain_value}")
     st.caption("Сначала показана предсказательность модели по температуре, ниже — качество прямой подгонки по содержанию сигма-фазы.")
+
+    with st.expander("Исключение точек для этого зерна", expanded=True):
+        st.caption("Здесь сохраняются именно ваши применённые исключения. Рекомендованные точки можно добавить в выбор, но они не заменяют ваш список автоматически.")
+        c_apply_rec, c_apply_user, c_reset = st.columns(3)
+        with c_apply_rec:
+            if st.button("Добавить рекомендованные", key=f"apply_recommended_sigma_grain_{grain_value}"):
+                merged = sorted(set(st.session_state.get(widget_key, [])) | set(recommended_ids))
+                st.session_state[widget_key] = merged
+                st.rerun()
+        with c_apply_user:
+            if st.button("Применить выбранные точки", key=f"apply_sigma_grain_{grain_value}"):
+                st.session_state[apply_key] = [pid for pid in st.session_state.get(widget_key, []) if pid in source_point_ids]
+                st.rerun()
+        with c_reset:
+            if st.button("Сбросить исключения", key=f"reset_sigma_grain_{grain_value}"):
+                st.session_state[apply_key] = []
+                st.session_state[widget_key] = []
+                st.rerun()
+
+        st.multiselect(
+            "Какие точки исключить из sigma-модели",
+            options=source_point_ids,
+            key=widget_key,
+            help="Сначала выберите точки, затем нажмите «Применить выбранные точки».",
+        )
+        st.write(f"Рекомендовано системой: {len(recommended_ids)}")
+        st.write(f"Сейчас реально исключено: {len(effective_selected)}")
+        if effective_selected:
+            st.caption("Исключены точки: " + ", ".join(effective_selected))
+        if len(source_point_ids) - len(effective_selected) < 7:
+            st.error("После текущего исключения останется меньше 7 точек. Такая подгонка не будет использоваться.")
+
     st.subheader("Качество предсказания температуры")
-    metric_cards(temperature_metric_summary(result.data))
+    metric_cards(temperature_metric_summary(active_result.data))
     st.subheader("Качество подгонки по содержанию сигма-фазы")
-    sigma_metrics = sigma_metric_summary(result.data)
+    sigma_metrics = sigma_metric_summary(active_result.data)
     metric_cards(sigma_metrics)
     st.subheader("Коэффициенты модели")
-    st.dataframe(result.params, use_container_width=True, hide_index=True)
-    st.caption(result.model_label)
-    st.code(result.formula_text, language="text")
+    st.dataframe(active_result.params, use_container_width=True, hide_index=True)
+    st.caption(active_result.model_label)
+    st.code(active_result.formula_text, language="text")
 
     st.subheader("Калькулятор температуры для этого номера зерна")
-    calc_params = result.params.set_index("Параметр модели")["Значение"].to_dict()
+    calc_params = active_result.params.set_index("Параметр модели")["Значение"].to_dict()
     with st.form(key=f"sigma_grain_form_{grain_value}"):
         c1, c2 = st.columns(2)
         with c1:
@@ -1034,62 +1086,23 @@ def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
         except Exception as exc:
             st.error(f"Не удалось выполнить расчет температуры для этого зерна: {exc}")
 
-    if not result.outlier_recommendation.empty:
-        st.warning("Ниже точки, которые система рекомендует проверить или временно исключить из подгонки sigma-модели.")
-        outlier_labels = result.outlier_recommendation["point_id"].astype(str).tolist()
-        apply_key = f"applied_exclude_sigma_grain_{grain_value}"
-        widget_key = f"exclude_sigma_grain_{grain_value}"
-        if apply_key not in st.session_state:
-            st.session_state[apply_key] = list(outlier_labels)
-        if widget_key not in st.session_state:
-            st.session_state[widget_key] = list(st.session_state[apply_key])
-        selected = st.multiselect(
-            "Исключить точки из sigma-модели",
-            options=result.data["point_id"].astype(str).tolist(),
-            key=widget_key,
-        )
-        c_apply, c_reset = st.columns(2)
-        with c_apply:
-            if st.button("Применить исключение выбранных точек", key=f"apply_sigma_grain_{grain_value}"):
-                st.session_state[apply_key] = list(selected)
-        with c_reset:
-            if st.button("Сбросить исключения", key=f"reset_sigma_grain_{grain_value}"):
-                st.session_state[apply_key] = []
-                st.session_state[widget_key] = []
-        effective_selected = st.session_state.get(apply_key, [])
-        if effective_selected:
-            st.info(f"Сейчас реально исключено точек: {len(effective_selected)}")
-            filtered = result.data[~result.data["point_id"].astype(str).isin(effective_selected)].copy()
-            if len(filtered) >= 7:
-                st.info(f"Пересчет sigma-модели после исключения {len(effective_selected)} точек.")
-                recalculated = fit_anchor_saturation_model(filtered, include_grain=False)
-                st.subheader("Качество предсказания температуры после пересчета")
-                metric_cards(temperature_metric_summary(recalculated.data))
-                st.subheader("Качество подгонки по содержанию сигма-фазы после пересчета")
-                metric_cards(sigma_metric_summary(recalculated.data))
-                st.dataframe(recalculated.params, use_container_width=True, hide_index=True)
-                st.code(recalculated.formula_text, language="text")
-                result = recalculated
-            else:
-                st.error("После исключения осталось слишком мало точек для устойчивой подгонки sigma-модели.")
-
     st.subheader("Таблица по точкам")
-    sigma_view = result.data[["point_id", "T", "tau", "G", "c_sigma", "sigma_pred_pct", "T_pred", "error_celsius"]].copy()
+    sigma_view = active_result.data[["point_id", "T", "tau", "G", "c_sigma", "sigma_pred_pct", "T_pred", "error_celsius"]].copy()
     sigma_view["Ошибка по cσ, %"] = sigma_view["c_sigma"] - sigma_view["sigma_pred_pct"]
     st.dataframe(sigma_view, use_container_width=True, hide_index=True)
     c1, c2 = st.columns(2)
     with c1:
-        sigma_scatter_fact_vs_pred(result.data, "Эксперимент vs модель по cσ")
-        sigma_vs_temperature_plot(result.data, "Зависимость cσ от температуры")
+        sigma_scatter_fact_vs_pred(active_result.data, "Эксперимент vs модель по cσ")
+        sigma_vs_temperature_plot(active_result.data, "Зависимость cσ от температуры")
     with c2:
-        sigma_vs_time_plot(result.data, "Зависимость cσ от времени")
+        sigma_vs_time_plot(active_result.data, "Зависимость cσ от времени")
         residual_plot(
-            result.data.assign(T_pred=result.data["sigma_pred_pct"], error_celsius=result.data["c_sigma"] - result.data["sigma_pred_pct"]),
+            active_result.data.assign(T_pred=active_result.data["sigma_pred_pct"], error_celsius=active_result.data["c_sigma"] - active_result.data["sigma_pred_pct"]),
             "Остатки по cσ",
         )
-    sigma_temperature_points_plot(result.data, "Обратный расчет температуры: модель и экспериментальные точки")
+    sigma_temperature_points_plot(active_result.data, "Обратный расчет температуры: модель и экспериментальные точки")
     with st.expander("Подробная статистическая сводка"):
-        st.text(result.model_summary)
+        st.text(active_result.model_summary)
 
 
 def predict_temperature_engineering(params: dict[str, float], D: float, tau: float, c_sigma: float, G: float | None = None) -> float:
@@ -2345,7 +2358,7 @@ with anchor_tab:
                         }
                     )
                     if grain == selected_sigma_grain:
-                        show_sigma_grain_block(grain_result, grain)
+                        show_sigma_grain_block(grain_result, grain, grain_df)
                 except Exception:
                     continue
 
@@ -2364,17 +2377,29 @@ with anchor_tab:
 
         with universal_tab:
             recommended_exclusions = get_recommended_sigma_exclusions(prepared_df, valid_grains)
+            selected_grains_for_recommended = st.multiselect(
+                "Для каких номеров зерна добавить рекомендованные системой точки в исключения",
+                options=valid_grains,
+                default=[],
+                key="sigma_recommended_grains_picker",
+            )
             c_apply_all, c_reset_all = st.columns(2)
             with c_apply_all:
-                if st.button("Применить все рекомендованные исключения по всем зернам sigma", key="apply_all_sigma_exclusions"):
-                    for grain, labels in recommended_exclusions.items():
-                        st.session_state[f"applied_exclude_sigma_grain_{grain}"] = list(labels)
-                        st.session_state[f"exclude_sigma_grain_{grain}"] = list(labels)
+                if st.button("Применить рекомендованные точки для выбранных зерен", key="apply_selected_sigma_exclusions"):
+                    for grain in selected_grains_for_recommended:
+                        labels = recommended_exclusions.get(grain, [])
+                        apply_key = f"applied_exclude_sigma_grain_{grain}"
+                        widget_key = f"exclude_sigma_grain_{grain}"
+                        merged = sorted(set(st.session_state.get(apply_key, [])) | set(labels))
+                        st.session_state[apply_key] = merged
+                        st.session_state[widget_key] = merged
+                    st.rerun()
             with c_reset_all:
                 if st.button("Сбросить все исключения по sigma-модели", key="reset_all_sigma_exclusions"):
                     for grain in valid_grains:
                         st.session_state[f"applied_exclude_sigma_grain_{grain}"] = []
                         st.session_state[f"exclude_sigma_grain_{grain}"] = []
+                    st.rerun()
 
             active_rows = []
             for grain in valid_grains:
