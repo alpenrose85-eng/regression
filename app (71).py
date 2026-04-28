@@ -1386,6 +1386,35 @@ def fit_sigma_universal_grain_size_model(
     return params, coeff_df, summary_text
 
 
+def build_sigma_coefficient_df(
+    cleaned_results: dict[float, FitResult],
+    allowed_grains: list[float] | None = None,
+) -> pd.DataFrame:
+    rows: list[dict[str, float]] = []
+    allowed = None if allowed_grains is None else {float(g) for g in allowed_grains}
+    for grain, result in cleaned_results.items():
+        grain_float = float(grain)
+        if allowed is not None and grain_float not in allowed:
+            continue
+        grain_size = GRAIN_SIZE_MM.get(grain_float)
+        if grain_size is None:
+            continue
+        params = result.params.set_index("Параметр модели")["Значение"].to_dict()
+        rows.append(
+            {
+                "G": grain_float,
+                "grain_size_mm": grain_size,
+                "ln_grain_size": float(np.log(grain_size)),
+                "log_a": float(params.get("log_a", np.nan)),
+                "p_exp": float(params.get("p_exp", np.nan)),
+                "m_exp": float(params.get("m_exp", np.nan)),
+                "R²": float(result.metrics.get("R²", np.nan)),
+                "RMSE_sigma": float(sigma_metric_summary(result.data).get("RMSE по cσ, %", np.nan)),
+            }
+        )
+    return pd.DataFrame(rows).dropna().sort_values(by=["G"]).reset_index(drop=True)
+
+
 def predict_temperature_diameter_universal(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
     ln_g = np.log(grain_size_mm)
     a_val = params["alpha0"] + params["alpha1"] * ln_g + params["alpha2"] * (ln_g ** 2)
@@ -2338,6 +2367,32 @@ with anchor_tab:
         )
         try:
             cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
+            sigma_coeff_all = build_sigma_coefficient_df(cleaned_sigma_results, allowed_grains=valid_grains)
+            if not sigma_coeff_all.empty:
+                st.markdown("**Сначала — обзор коэффициентов по всем доступным номерам зерна.**")
+                coeff_all_view = sigma_coeff_all[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].rename(
+                    columns={
+                        "grain_size_mm": "Размер зерна, мм",
+                        "log_a": "log(A)",
+                        "p_exp": "p",
+                        "m_exp": "m",
+                        "R²": "R² по T",
+                        "RMSE_sigma": "RMSE по cσ, %",
+                    }
+                )
+                st.dataframe(coeff_all_view, use_container_width=True, hide_index=True)
+                st.subheader("Сравнение 4 форм аппроксимации коэффициентов sigma-модели")
+                analysis_log_a = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"log_a": "a"}), "a").assign(**{"Коэффициент": "log(A)"})
+                analysis_p = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"p_exp": "a"}), "a").assign(**{"Коэффициент": "p"})
+                analysis_m = analyze_coefficient_forms(sigma_coeff_all.rename(columns={"m_exp": "a"}), "a").assign(**{"Коэффициент": "m"})
+                tab_a_all, tab_p_all, tab_m_all = st.tabs(["Коэффициент log(A)", "Коэффициент p", "Коэффициент m"])
+                with tab_a_all:
+                    st.dataframe(analysis_log_a, use_container_width=True, hide_index=True)
+                with tab_p_all:
+                    st.dataframe(analysis_p, use_container_width=True, hide_index=True)
+                with tab_m_all:
+                    st.dataframe(analysis_m, use_container_width=True, hide_index=True)
+
             selected_params, sigma_coeff_df, sigma_summary = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="m_const_median")
             sigma_eval = evaluate_sigma_universal_model(selected_params, cleaned_sigma_results)
 
