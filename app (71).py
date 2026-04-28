@@ -87,7 +87,7 @@ GRAIN_SIZE_MM = {
     10.0: 0.011,
 }
 
-SIGMA_UNIVERSAL_GRAINS = [8.0, 9.0, 10.0]
+SIGMA_UNIVERSAL_GRAINS = [3.0, 5.0, 8.0, 9.0, 10.0]
 
 SCIENTIFIC_UNIVERSAL_SIGMA_PARAGRAPH = (
     "Универсализированная модель содержания σ-фазы по размеру зерна строится по наиболее надежной части "
@@ -1309,77 +1309,38 @@ def fit_sigma_universal_grain_size_model(
     if len(coeff_df) < 3:
         raise ValueError("Для универсальной sigma-модели нужны минимум 3 очищенные зерновые модели с известным размером зерна.")
 
-    X = sm.add_constant(coeff_df[["ln_grain_size"]])
+    ln_g = coeff_df["ln_grain_size"].to_numpy(dtype=float)
+    X = np.column_stack([np.ones(len(coeff_df)), ln_g, ln_g ** 2])
     model_log_a = sm.OLS(coeff_df["log_a"], X).fit()
+    model_p = sm.OLS(coeff_df["p_exp"], X).fit()
+    model_m = sm.OLS(coeff_df["m_exp"], X).fit()
 
-    weights = 1.0 / np.maximum(coeff_df["RMSE_sigma"].to_numpy(dtype=float), 1e-9)
-
-    def aggregate_const(series: pd.Series, mode: str) -> float:
-        values = series.to_numpy(dtype=float)
-        if mode == "mean":
-            return float(np.mean(values))
-        if mode == "median":
-            return float(np.median(values))
-        if mode == "weighted":
-            return float(np.average(values, weights=weights))
-        raise ValueError(f"Неизвестный режим константы: {mode}")
-
-    if variant == "full":
-        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
-        model_m = sm.OLS(coeff_df["m_exp"], X).fit()
-        beta0 = float(model_p.params.get("const", np.nan))
-        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
-        gamma0 = float(model_m.params.get("const", np.nan))
-        gamma1 = float(model_m.params.get("ln_grain_size", np.nan))
-        variant_label = "A(dg), p(dg), m(dg)"
-    elif variant == "m_const_mean":
-        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
-        model_m = None
-        beta0 = float(model_p.params.get("const", np.nan))
-        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
-        gamma0 = aggregate_const(coeff_df["m_exp"], "mean")
-        gamma1 = 0.0
-        variant_label = "A(dg), p(dg), m=const (среднее)"
-    elif variant == "m_const_median":
-        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
-        model_m = None
-        beta0 = float(model_p.params.get("const", np.nan))
-        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
-        gamma0 = aggregate_const(coeff_df["m_exp"], "median")
-        gamma1 = 0.0
-        variant_label = "A(dg), p(dg), m=const (медиана)"
-    elif variant == "m_const_weighted":
-        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
-        model_m = None
-        beta0 = float(model_p.params.get("const", np.nan))
-        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
-        gamma0 = aggregate_const(coeff_df["m_exp"], "weighted")
-        gamma1 = 0.0
-        variant_label = "A(dg), p(dg), m=const (взвешенное)"
-    else:
-        raise ValueError(f"Неизвестный вариант sigma-метамодели: {variant}")
+    params_a = np.asarray(model_log_a.params, dtype=float)
+    params_p = np.asarray(model_p.params, dtype=float)
+    params_m = np.asarray(model_m.params, dtype=float)
 
     params = {
-        "alpha0": float(model_log_a.params.get("const", np.nan)),
-        "alpha1": float(model_log_a.params.get("ln_grain_size", np.nan)),
-        "beta0": beta0,
-        "beta1": beta1,
-        "gamma0": gamma0,
-        "gamma1": gamma1,
+        "alpha0": float(params_a[0]),
+        "alpha1": float(params_a[1]),
+        "alpha2": float(params_a[2]),
+        "beta0": float(params_p[0]),
+        "beta1": float(params_p[1]),
+        "beta2": float(params_p[2]),
+        "gamma0": float(params_m[0]),
+        "gamma1": float(params_m[1]),
+        "gamma2": float(params_m[2]),
         "r2_log_a": float(model_log_a.rsquared),
-        "r2_p": float(model_p.rsquared) if model_p is not None else np.nan,
-        "r2_m": float(model_m.rsquared) if model_m is not None else np.nan,
-        "variant": variant,
-        "variant_label": variant_label,
+        "r2_p": float(model_p.rsquared),
+        "r2_m": float(model_m.rsquared),
+        "variant": "quadratic_full",
+        "variant_label": "log(A)(dg), p(dg), m(dg) = u0 + u1·ln(dg) + u2·[ln(dg)]²",
     }
-    p_text = f"p(dg)=beta0+beta1·ln(dg), R²={model_p.rsquared:.4f}" if model_p is not None and beta1 != 0.0 else f"p=const={beta0:.8f}"
-    m_text = f"m(dg)=gamma0+gamma1·ln(dg), R²={model_m.rsquared:.4f}" if model_m is not None and gamma1 != 0.0 else f"m=const={gamma0:.8f}"
     included_grains = ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in coeff_df["G"].tolist())
     summary_text = (
-        f"Метамодель коэффициентов очищенных sigma-моделей по размеру зерна. Использованы зерна: {included_grains}. Вариант: {variant_label}.\n\n"
-        f"log(A)(dg)=alpha0+alpha1·ln(dg), R²={model_log_a.rsquared:.4f}\n"
-        f"{p_text}\n"
-        f"{m_text}\n\n"
+        f"Метамодель коэффициентов очищенных sigma-моделей по размеру зерна. Использованы зерна: {included_grains}.\n\n"
+        f"log(A)(dg)=alpha0+alpha1·ln(dg)+alpha2·[ln(dg)]², R²={model_log_a.rsquared:.4f}\n"
+        f"p(dg)=beta0+beta1·ln(dg)+beta2·[ln(dg)]², R²={model_p.rsquared:.4f}\n"
+        f"m(dg)=gamma0+gamma1·ln(dg)+gamma2·[ln(dg)]², R²={model_m.rsquared:.4f}\n\n"
         "Итоговая универсальная форма:\n"
         "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)"
     )
@@ -1434,9 +1395,9 @@ def predict_temperature_sigma_universal(params: dict[str, float], tau: float, c_
     if c_sigma <= 0:
         raise ValueError("Содержание сигма-фазы должно быть больше нуля.")
     ln_g = np.log(grain_size_mm)
-    log_a = params["alpha0"] + params["alpha1"] * ln_g
-    p_exp = params["beta0"] + params["beta1"] * ln_g
-    m_exp = params["gamma0"] + params["gamma1"] * ln_g
+    log_a = params["alpha0"] + params["alpha1"] * ln_g + params["alpha2"] * (ln_g ** 2)
+    p_exp = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
+    m_exp = params["gamma0"] + params["gamma1"] * ln_g + params["gamma2"] * (ln_g ** 2)
     if not np.isfinite(m_exp) or abs(m_exp) < 1e-12:
         raise ValueError("Универсальная sigma-модель дала слишком малый показатель степени m.")
     denom = np.exp(log_a) * np.power(max(tau, 1e-12), p_exp)
@@ -2362,14 +2323,14 @@ with anchor_tab:
         st.write(
             "Подход повторяет универсальную модель роста диаметра: сначала строятся отдельные sigma-модели "
             "для каждого номера зерна, затем коэффициенты log(A) и p выражаются через логарифм среднего размера зерна. "
-            "В общую sigma-модель включены только зерна 8, 9 и 10, а коэффициент m фиксирован как константа по медиане, "
-            "потому что такой вариант устойчивее к шуму и не даёт зерну 5 портить общую зависимость."
+            "В общую sigma-модель включены все пять доступных зерен: 3, 5, 8, 9 и 10. Коэффициент m фиксирован как константа по медиане, "
+            "а зависимости для log(A) и p подбираются по этим пяти зерновым моделям."
         )
         try:
             cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
             sigma_coeff_all = build_sigma_coefficient_df(cleaned_sigma_results, allowed_grains=valid_grains)
             if not sigma_coeff_all.empty:
-                st.markdown("**Сначала — обзор коэффициентов по всем доступным номерам зерна.**")
+                st.markdown("**Сначала — обзор коэффициентов по всем доступным номерам зерна, уже по очищенным локальным sigma-моделям.**")
                 coeff_all_view = sigma_coeff_all[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].rename(
                     columns={
                         "grain_size_mm": "Размер зерна, мм",
@@ -2393,7 +2354,7 @@ with anchor_tab:
                 with tab_m_all:
                     st.dataframe(analysis_m, use_container_width=True, hide_index=True)
 
-            selected_params, sigma_coeff_df, sigma_summary = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="m_const_median")
+            selected_params, sigma_coeff_df, sigma_summary = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="quadratic_full")
             sigma_eval = evaluate_sigma_universal_model(selected_params, cleaned_sigma_results)
 
             coeff_view = sigma_coeff_df[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].copy()
@@ -2410,18 +2371,19 @@ with anchor_tab:
             st.dataframe(coeff_view, use_container_width=True, hide_index=True)
 
             st.info(
-                f"Для общей sigma-модели используются только зерна 8, 9 и 10. Текущий вариант: m = const по медиане. "
+                f"Для общей sigma-модели используются все пять зерен: 3, 5, 8, 9, 10, причем коэффициенты берутся из очищенных локальных sigma-моделей. "
+                f"Текущий вариант: для log(A), p и m используется форма u0 + u1·ln(dg) + u2·[ln(dg)]². "
                 f"RMSE={sigma_eval['RMSE по T, °C']:.4f} °C, R²={sigma_eval['R² по T']:.4f}."
             )
 
             st.code(
                 "\n".join(
                     [
-                        f"log(A)(dg) = {selected_params['alpha0']:.8f} + ({selected_params['alpha1']:.8f}) · ln(dg)",
-                        f"p(dg) = {selected_params['beta0']:.8f} + ({selected_params['beta1']:.8f}) · ln(dg)",
-                        f"m = {selected_params['gamma0']:.8f}",
+                        f"log(A)(dg) = {selected_params['alpha0']:.8f} + ({selected_params['alpha1']:.8f}) · ln(dg) + ({selected_params['alpha2']:.8f}) · [ln(dg)]²",
+                        f"p(dg) = {selected_params['beta0']:.8f} + ({selected_params['beta1']:.8f}) · ln(dg) + ({selected_params['beta2']:.8f}) · [ln(dg)]²",
+                        f"m(dg) = {selected_params['gamma0']:.8f} + ({selected_params['gamma1']:.8f}) · ln(dg) + ({selected_params['gamma2']:.8f}) · [ln(dg)]²",
                         "",
-                        "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m",
+                        "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)",
                     ]
                 ),
                 language="text",
@@ -2431,6 +2393,7 @@ with anchor_tab:
                     {
                         "R² для log(A)(dg)": selected_params["r2_log_a"],
                         "R² для p(dg)": selected_params["r2_p"],
+                        "R² для m(dg)": selected_params["r2_m"],
                         "R² по T": sigma_eval["R² по T"],
                         "RMSE по T, °C": sigma_eval["RMSE по T, °C"],
                         "Количество зерновых моделей": float(len(sigma_coeff_df)),
