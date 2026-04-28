@@ -87,7 +87,18 @@ GRAIN_SIZE_MM = {
     10.0: 0.011,
 }
 
-SIGMA_UNIVERSAL_GRAINS = [8.0, 9.0, 10.0]
+SIGMA_UNIVERSAL_GRAINS = [5.0, 8.0, 9.0, 10.0]
+
+SCIENTIFIC_UNIVERSAL_SIGMA_PARAGRAPH = (
+    "Универсализированная модель содержания σ-фазы по размеру зерна строится по наиболее надежной части "
+    "экспериментальной выборки, где содержание σ-фазы достаточно велико для устойчивого измерения и, "
+    "следовательно, коэффициенты локальных зависимостей определяются с меньшим влиянием случайного шума. "
+    "В этой постановке отдельные зерновые модели сначала подбираются независимо, после чего их коэффициенты "
+    "рассматриваются как функции физического размера зерна. Такой подход позволяет получить не формально "
+    "универсальную зависимость для всех возможных зерен, а физически и статистически обоснованную "
+    "интерполяционную метамодель в области качественных данных, пригодную для осторожной экстраполяции на "
+    "соседние зеренные состояния."
+)
 
 
 @dataclass
@@ -980,30 +991,33 @@ def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
 
     st.subheader("Калькулятор температуры для этого номера зерна")
     calc_params = result.params.set_index("Параметр модели")["Значение"].to_dict()
-    c1, c2 = st.columns(2)
-    with c1:
-        tau_value = st.number_input(
-            f"Время наработки τ для зерна {grain_value}",
-            min_value=1e-9,
-            value=1000.0,
-            step=100.0,
-            format="%.6f",
-            key=f"sigma_grain_tau_{grain_value}",
-        )
-    with c2:
-        sigma_value = st.number_input(
-            f"Содержание сигма-фазы cσ для зерна {grain_value}, %",
-            min_value=1e-9,
-            value=1.0,
-            step=0.1,
-            format="%.6f",
-            key=f"sigma_grain_sigma_{grain_value}",
-        )
-    try:
-        calc_temp = predict_temperature_anchor_saturation(calc_params, 1.0, tau_value, sigma_value, grain_value)
-        st.metric("Расчетная температура, °C", f"{calc_temp:.4f}")
-    except Exception as exc:
-        st.error(f"Не удалось выполнить расчет температуры для этого зерна: {exc}")
+    with st.form(key=f"sigma_grain_form_{grain_value}"):
+        c1, c2 = st.columns(2)
+        with c1:
+            tau_value = st.number_input(
+                f"Время наработки τ для зерна {grain_value}",
+                min_value=1.0,
+                value=1000.0,
+                step=1.0,
+                format="%.0f",
+                key=f"sigma_grain_tau_{grain_value}",
+            )
+        with c2:
+            sigma_value = st.number_input(
+                f"Содержание сигма-фазы cσ для зерна {grain_value}, %",
+                min_value=0.01,
+                value=1.0,
+                step=0.01,
+                format="%.2f",
+                key=f"sigma_grain_sigma_{grain_value}",
+            )
+        submitted = st.form_submit_button("Рассчитать")
+    if submitted:
+        try:
+            calc_temp = predict_temperature_anchor_saturation(calc_params, 1.0, tau_value, sigma_value, grain_value)
+            st.metric("Расчетная температура, °C", f"{calc_temp:.4f}")
+        except Exception as exc:
+            st.error(f"Не удалось выполнить расчет температуры для этого зерна: {exc}")
 
     if not result.outlier_recommendation.empty:
         st.warning("Ниже точки, которые система рекомендует проверить или временно исключить из подгонки sigma-модели.")
@@ -1190,6 +1204,8 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
         "b_const": b_const,
         "gamma0": float(model_c.params.get("const", np.nan)),
         "gamma1": float(model_c.params.get("ln_grain_size", np.nan)),
+        "r2_a": float(model_a.rsquared),
+        "r2_c": float(model_c.rsquared),
     }
     included_b_grains = ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in b_source_df["G"].tolist())
     excluded_b_text = "нет"
@@ -1230,10 +1246,22 @@ def fit_sigma_universal_grain_size_model(
         )
     coeff_df = pd.DataFrame(rows).dropna()
     if len(coeff_df) < 3:
-        raise ValueError("Для универсальной sigma-модели по зернам 8, 9 и 10 нужны 3 очищенные зерновые модели с известным размером зерна.")
+        raise ValueError("Для универсальной sigma-модели нужны минимум 3 очищенные зерновые модели с известным размером зерна.")
 
     X = sm.add_constant(coeff_df[["ln_grain_size"]])
     model_log_a = sm.OLS(coeff_df["log_a"], X).fit()
+
+    weights = 1.0 / np.maximum(coeff_df["RMSE_sigma"].to_numpy(dtype=float), 1e-9)
+
+    def aggregate_const(series: pd.Series, mode: str) -> float:
+        values = series.to_numpy(dtype=float)
+        if mode == "mean":
+            return float(np.mean(values))
+        if mode == "median":
+            return float(np.median(values))
+        if mode == "weighted":
+            return float(np.average(values, weights=weights))
+        raise ValueError(f"Неизвестный режим константы: {mode}")
 
     if variant == "full":
         model_p = sm.OLS(coeff_df["p_exp"], X).fit()
@@ -1243,22 +1271,30 @@ def fit_sigma_universal_grain_size_model(
         gamma0 = float(model_m.params.get("const", np.nan))
         gamma1 = float(model_m.params.get("ln_grain_size", np.nan))
         variant_label = "A(dg), p(dg), m(dg)"
-    elif variant == "m_const":
+    elif variant == "m_const_mean":
         model_p = sm.OLS(coeff_df["p_exp"], X).fit()
         model_m = None
         beta0 = float(model_p.params.get("const", np.nan))
         beta1 = float(model_p.params.get("ln_grain_size", np.nan))
-        gamma0 = float(coeff_df["m_exp"].mean())
+        gamma0 = aggregate_const(coeff_df["m_exp"], "mean")
         gamma1 = 0.0
-        variant_label = "A(dg), p(dg), m=const"
-    elif variant == "p_m_const":
-        model_p = None
+        variant_label = "A(dg), p(dg), m=const (среднее)"
+    elif variant == "m_const_median":
+        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
         model_m = None
-        beta0 = float(coeff_df["p_exp"].mean())
-        beta1 = 0.0
-        gamma0 = float(coeff_df["m_exp"].mean())
+        beta0 = float(model_p.params.get("const", np.nan))
+        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
+        gamma0 = aggregate_const(coeff_df["m_exp"], "median")
         gamma1 = 0.0
-        variant_label = "A(dg), p=const, m=const"
+        variant_label = "A(dg), p(dg), m=const (медиана)"
+    elif variant == "m_const_weighted":
+        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
+        model_m = None
+        beta0 = float(model_p.params.get("const", np.nan))
+        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
+        gamma0 = aggregate_const(coeff_df["m_exp"], "weighted")
+        gamma1 = 0.0
+        variant_label = "A(dg), p(dg), m=const (взвешенное)"
     else:
         raise ValueError(f"Неизвестный вариант sigma-метамодели: {variant}")
 
@@ -1277,8 +1313,9 @@ def fit_sigma_universal_grain_size_model(
     }
     p_text = f"p(dg)=beta0+beta1·ln(dg), R²={model_p.rsquared:.4f}" if model_p is not None and beta1 != 0.0 else f"p=const={beta0:.8f}"
     m_text = f"m(dg)=gamma0+gamma1·ln(dg), R²={model_m.rsquared:.4f}" if model_m is not None and gamma1 != 0.0 else f"m=const={gamma0:.8f}"
+    included_grains = ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in coeff_df["G"].tolist())
     summary_text = (
-        f"Метамодель коэффициентов очищенных sigma-моделей по размеру зерна только для зерен 8, 9 и 10. Вариант: {variant_label}.\n\n"
+        f"Метамодель коэффициентов очищенных sigma-моделей по размеру зерна. Использованы зерна: {included_grains}. Вариант: {variant_label}.\n\n"
         f"log(A)(dg)=alpha0+alpha1·ln(dg), R²={model_log_a.rsquared:.4f}\n"
         f"{p_text}\n"
         f"{m_text}\n\n"
@@ -1346,6 +1383,48 @@ def evaluate_sigma_universal_model(params: dict[str, float], cleaned_results: di
     }
 
 
+def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results: dict[float, FitResult]) -> dict[str, float]:
+    rows: list[pd.DataFrame] = []
+    for grain, result in cleaned_results.items():
+        grain_size = GRAIN_SIZE_MM.get(float(grain))
+        if grain_size is None:
+            continue
+        df = result.data.copy()
+        df["T_pred_universal"] = df.apply(
+            lambda row: predict_temperature_diameter_universal(params, float(row["D"]), float(row["tau"]), grain_size),
+            axis=1,
+        )
+        rows.append(df)
+    if not rows:
+        raise ValueError("Нет данных для оценки универсальной модели диаметра.")
+    eval_df = pd.concat(rows, ignore_index=True)
+    errors = eval_df["T"] - eval_df["T_pred_universal"]
+    return {
+        "Количество точек": float(len(eval_df)),
+        "R² по T": float(r2_score(eval_df["T"], eval_df["T_pred_universal"])) if len(eval_df) >= 2 else np.nan,
+        "RMSE по T, °C": float(np.sqrt(mean_squared_error(eval_df["T"], eval_df["T_pred_universal"]))),
+        "MAE по T, °C": float(mean_absolute_error(eval_df["T"], eval_df["T_pred_universal"])),
+        "MAPE по T, %": float(np.mean(np.abs(errors) / np.maximum(np.abs(eval_df["T"]), 1e-9)) * 100.0),
+    }
+
+
+def parse_optional_float(value: str) -> float | None:
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        return None
+    return float(text)
+
+
+def clear_sigma_when_diameter_entered() -> None:
+    if str(st.session_state.get("universal_choice_d", "")).strip():
+        st.session_state["universal_choice_sigma"] = ""
+
+
+def clear_diameter_when_sigma_entered() -> None:
+    if str(st.session_state.get("universal_choice_sigma", "")).strip():
+        st.session_state["universal_choice_d"] = ""
+
+
 def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
     st.subheader(f"Модель роста диаметра для номера зерна {grain_value}")
     metric_cards(result.metrics)
@@ -1356,30 +1435,33 @@ def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
 
     st.subheader("Калькулятор температуры для этого номера зерна")
     calc_params = result.params.set_index("Параметр модели")["Значение"].to_dict()
-    c1, c2 = st.columns(2)
-    with c1:
-        tau_value = st.number_input(
-            f"Время наработки τ для модели диаметра, зерно {grain_value}",
-            min_value=1e-9,
-            value=1000.0,
-            step=100.0,
-            format="%.6f",
-            key=f"diameter_tau_{grain_value}",
-        )
-    with c2:
-        d_value = st.number_input(
-            f"Эквивалентный диаметр D для зерна {grain_value}",
-            min_value=1e-9,
-            value=10.0,
-            step=0.1,
-            format="%.6f",
-            key=f"diameter_D_{grain_value}",
-        )
-    try:
-        temp_value = predict_temperature_diameter_growth(calc_params, d_value, tau_value)
-        st.metric("Расчетная температура по модели диаметра, °C", f"{temp_value:.4f}")
-    except Exception as exc:
-        st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
+    with st.form(key=f"diameter_grain_form_{grain_value}"):
+        c1, c2 = st.columns(2)
+        with c1:
+            tau_value = st.number_input(
+                f"Время наработки τ для модели диаметра, зерно {grain_value}",
+                min_value=1.0,
+                value=1000.0,
+                step=1.0,
+                format="%.0f",
+                key=f"diameter_tau_{grain_value}",
+            )
+        with c2:
+            d_value = st.number_input(
+                f"Эквивалентный диаметр D для зерна {grain_value}",
+                min_value=0.01,
+                value=10.0,
+                step=0.01,
+                format="%.2f",
+                key=f"diameter_D_{grain_value}",
+            )
+        submitted = st.form_submit_button("Рассчитать")
+    if submitted:
+        try:
+            temp_value = predict_temperature_diameter_growth(calc_params, d_value, tau_value)
+            st.metric("Расчетная температура по модели диаметра, °C", f"{temp_value:.4f}")
+        except Exception as exc:
+            st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
 
     show_result_block(
         result,
@@ -1476,17 +1558,22 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
 
 def show_multi_calculator(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
     st.subheader("Калькулятор температуры по моделям")
-    st.caption("Введите параметры структуры и наработки — программа сразу посчитает температуру по базовой, улучшенной и sigma-модели по отдельным зернам.")
+    st.caption("Введите параметры структуры и наработки, затем нажмите кнопку расчета.")
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        tau_value = st.number_input("Время наработки τ", min_value=1e-9, value=1000.0, step=100.0, format="%.6f")
-    with c2:
-        d_value = st.number_input("Эквивалентный диаметр D", min_value=1e-9, value=10.0, step=0.1, format="%.6f")
-    with c3:
-        sigma_value = st.number_input("Содержание сигма-фазы cσ, %", min_value=1e-9, value=1.0, step=0.1, format="%.6f")
-    with c4:
-        grain_value = st.number_input("Номер зерна G", value=8.0, step=1.0, format="%.6f")
+    with st.form(key="multi_model_calc_form"):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            tau_value = st.number_input("Время наработки τ", min_value=1.0, value=1000.0, step=1.0, format="%.0f")
+        with c2:
+            d_value = st.number_input("Эквивалентный диаметр D", min_value=0.01, value=10.0, step=0.01, format="%.2f")
+        with c3:
+            sigma_value = st.number_input("Содержание сигма-фазы cσ, %", min_value=0.01, value=1.0, step=0.01, format="%.2f")
+        with c4:
+            grain_value = st.number_input("Номер зерна G", min_value=1.0, value=8.0, step=1.0, format="%.0f")
+        submitted = st.form_submit_button("Рассчитать")
+
+    if not submitted:
+        return
 
     base_params = base_result.params.set_index("Параметр модели")["Значение"].to_dict()
     improved_params = improved_result.params.set_index("Параметр модели")["Значение"].to_dict()
@@ -1515,6 +1602,184 @@ def show_multi_calculator(base_result: FitResult, improved_result: FitResult, an
         st.dataframe(calc_df, use_container_width=True, hide_index=True)
     except Exception as exc:
         st.error(f"Не удалось выполнить расчет: {exc}")
+
+
+def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[float]) -> None:
+    st.subheader("Универсальные модели по размеру зерна")
+    st.markdown(f"**Научное обоснование:** {SCIENTIFIC_UNIVERSAL_SIGMA_PARAGRAPH}")
+
+    if not valid_grains:
+        st.warning("Для построения универсальных моделей недостаточно зерновых наборов с минимум 7 точками.")
+        return
+
+    diameter_error_local = None
+    sigma_error_local = None
+    diameter_payload = None
+    sigma_variants_payload = []
+    selected_sigma_variant = None
+
+    try:
+        cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
+        universal_diameter_params, diameter_coeff_df, diameter_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
+        diameter_eval = evaluate_diameter_universal_model(universal_diameter_params, cleaned_diameter_results)
+        diameter_payload = {
+            "params": universal_diameter_params,
+            "coeff_df": diameter_coeff_df,
+            "summary": diameter_summary,
+            "eval": diameter_eval,
+        }
+    except Exception as exc:
+        diameter_error_local = str(exc)
+
+    try:
+        cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
+        sigma_variants = [
+            ("full", "Версия 1: A(dg), p(dg), m(dg)"),
+            ("m_const_mean", "Версия 2: A(dg), p(dg), m=const (среднее)"),
+            ("m_const_median", "Версия 3: A(dg), p(dg), m=const (медиана)"),
+            ("m_const_weighted", "Версия 4: A(dg), p(dg), m=const (взвешенное)"),
+        ]
+        for variant_key, variant_title in sigma_variants:
+            params_item, coeff_df_item, summary_item = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant=variant_key)
+            eval_item = evaluate_sigma_universal_model(params_item, cleaned_sigma_results)
+            sigma_variants_payload.append(
+                {
+                    "key": variant_key,
+                    "title": variant_title,
+                    "params": params_item,
+                    "coeff_df": coeff_df_item,
+                    "summary": summary_item,
+                    "eval": eval_item,
+                }
+            )
+        if sigma_variants_payload:
+            selected_sigma_variant = min(
+                sigma_variants_payload,
+                key=lambda item: (item["eval"]["RMSE по T, °C"], item["eval"]["MAE по T, °C"]),
+            )
+    except Exception as exc:
+        sigma_error_local = str(exc)
+
+    quality_rows = []
+    if diameter_payload is not None:
+        quality_rows.append(
+            {
+                "Модель": "Универсальная модель диаметра",
+                "Версия": "a(dg), b=const, c(dg)",
+                "R² по T": diameter_payload["eval"]["R² по T"],
+                "RMSE по T, °C": diameter_payload["eval"]["RMSE по T, °C"],
+                "MAE по T, °C": diameter_payload["eval"]["MAE по T, °C"],
+                "MAPE по T, %": diameter_payload["eval"]["MAPE по T, %"],
+                "Количество точек": diameter_payload["eval"]["Количество точек"],
+            }
+        )
+    if selected_sigma_variant is not None:
+        quality_rows.append(
+            {
+                "Модель": "Универсальная sigma-модель",
+                "Версия": selected_sigma_variant["title"],
+                "R² по T": selected_sigma_variant["eval"]["R² по T"],
+                "RMSE по T, °C": selected_sigma_variant["eval"]["RMSE по T, °C"],
+                "MAE по T, °C": selected_sigma_variant["eval"]["MAE по T, °C"],
+                "MAPE по T, %": selected_sigma_variant["eval"]["MAPE по T, %"],
+                "Количество точек": selected_sigma_variant["eval"]["Количество точек"],
+            }
+        )
+    if quality_rows:
+        st.subheader("Сравнение качества универсальных моделей")
+        st.dataframe(pd.DataFrame(quality_rows), use_container_width=True, hide_index=True)
+
+    col_left, col_right = st.columns(2)
+    with col_left:
+        st.subheader("Формула универсальной модели диаметра")
+        if diameter_payload is None:
+            st.error(f"Модель диаметра недоступна: {diameter_error_local}")
+        else:
+            p = diameter_payload["params"]
+            st.code(
+                "\n".join(
+                    [
+                        "ln(D) = a(dg) + b·ln(τ) + c(dg)·(1/T(K))",
+                        f"a(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg)",
+                        f"b = {p['b_const']:.8f}",
+                        f"c(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg)",
+                    ]
+                ),
+                language="text",
+            )
+            with st.expander("Сводка по универсальной модели диаметра"):
+                st.text(diameter_payload["summary"])
+
+    with col_right:
+        st.subheader("Формула универсальной sigma-модели")
+        if selected_sigma_variant is None:
+            st.error(f"Sigma-модель недоступна: {sigma_error_local}")
+        else:
+            if len(sigma_variants_payload) > 1:
+                sigma_titles = [item["title"] for item in sigma_variants_payload]
+                selected_title = st.selectbox(
+                    "Выберите версию sigma-модели",
+                    sigma_titles,
+                    index=sigma_titles.index(selected_sigma_variant["title"]),
+                    key="universal_models_sigma_variant",
+                )
+                selected_sigma_variant = next(item for item in sigma_variants_payload if item["title"] == selected_title)
+            p = selected_sigma_variant["params"]
+            st.code(
+                "\n".join(
+                    [
+                        "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)",
+                        f"log(A)(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg)",
+                        f"p(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg)",
+                        f"m(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg)",
+                    ]
+                ),
+                language="text",
+            )
+            with st.expander("Сводка по выбранной универсальной sigma-модели"):
+                st.text(selected_sigma_variant["summary"])
+
+    st.subheader("Калькулятор по универсальным моделям")
+    st.caption("Введите либо процент σ-фазы, либо эквивалентный диаметр. Расчет запускается только по кнопке.")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        tau_value = st.number_input("Время наработки τ", min_value=1.0, value=1000.0, step=1.0, format="%.0f", key="universal_choice_tau")
+    with c2:
+        grain_number = st.selectbox("Номер зерна G", sorted(GRAIN_SIZE_MM.keys()), key="universal_choice_grain")
+    with c3:
+        st.text_input(
+            "Эквивалентный диаметр D, мкм",
+            key="universal_choice_d",
+            on_change=clear_sigma_when_diameter_entered,
+            placeholder="например, 7.25",
+        )
+    with c4:
+        st.text_input(
+            "Содержание σ-фазы, %",
+            key="universal_choice_sigma",
+            on_change=clear_diameter_when_sigma_entered,
+            placeholder="например, 4.50",
+        )
+
+    if st.button("Рассчитать", key="universal_models_calculate"):
+        try:
+            diameter_value = parse_optional_float(st.session_state.get("universal_choice_d", ""))
+            sigma_value = parse_optional_float(st.session_state.get("universal_choice_sigma", ""))
+            if (diameter_value is None and sigma_value is None) or (diameter_value is not None and sigma_value is not None):
+                raise ValueError("Нужно заполнить только одно поле: либо диаметр, либо процент σ-фазы.")
+            grain_size = GRAIN_SIZE_MM[float(grain_number)]
+            if diameter_value is not None:
+                if diameter_payload is None:
+                    raise ValueError(diameter_error_local or "Универсальная модель диаметра недоступна.")
+                temp_value = predict_temperature_diameter_universal(diameter_payload["params"], round(diameter_value, 2), tau_value, grain_size)
+                st.success(f"Расчет по универсальной модели диаметра: {temp_value:.4f} °C")
+            else:
+                if selected_sigma_variant is None:
+                    raise ValueError(sigma_error_local or "Универсальная sigma-модель недоступна.")
+                temp_value = predict_temperature_sigma_universal(selected_sigma_variant["params"], tau_value, round(sigma_value, 2), grain_size)
+                st.success(f"Расчет по универсальной sigma-модели: {temp_value:.4f} °C")
+        except Exception as exc:
+            st.error(f"Не удалось выполнить расчет: {exc}")
 
 
 def show_result_block(
@@ -1703,7 +1968,7 @@ if diameter_result is not None:
 if anchor_result is not None:
     enrich_real_point_metrics(anchor_result, predict_temperature_anchor_saturation)
 
-main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab = st.tabs([
+main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab, universal_models_tab = st.tabs([
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
@@ -1711,6 +1976,7 @@ main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calcul
     "Простая sigma-модель",
     "Сравнение моделей",
     "Калькулятор",
+    "Универсальные модели",
 ])
 
 with main_tab:
@@ -1933,18 +2199,21 @@ with diameter_tab:
                     st.text(universal_summary)
 
                 st.subheader("Калькулятор температуры по универсальной модели")
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    tau_value = st.number_input("Время наработки τ для универсальной модели", min_value=1e-9, value=1000.0, step=100.0, format="%.6f", key="diameter_universal_tau")
-                with c2:
-                    d_value = st.number_input("Эквивалентный диаметр D для универсальной модели", min_value=1e-9, value=10.0, step=0.1, format="%.6f", key="diameter_universal_D")
-                with c3:
-                    grain_number = st.selectbox("Номер зерна для универсальной модели", sorted(GRAIN_SIZE_MM.keys()), key="diameter_universal_grain")
-                try:
-                    temp_value = predict_temperature_diameter_universal(universal_params, d_value, tau_value, GRAIN_SIZE_MM[float(grain_number)])
-                    st.metric("Расчетная температура по универсальной модели, °C", f"{temp_value:.4f}")
-                except Exception as exc:
-                    st.error(f"Не удалось выполнить расчет по универсальной модели: {exc}")
+                with st.form(key="diameter_universal_form"):
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        tau_value = st.number_input("Время наработки τ для универсальной модели", min_value=1.0, value=1000.0, step=1.0, format="%.0f", key="diameter_universal_tau")
+                    with c2:
+                        d_value = st.number_input("Эквивалентный диаметр D для универсальной модели", min_value=0.01, value=10.0, step=0.01, format="%.2f", key="diameter_universal_D")
+                    with c3:
+                        grain_number = st.selectbox("Номер зерна для универсальной модели", sorted(GRAIN_SIZE_MM.keys()), key="diameter_universal_grain")
+                    submitted = st.form_submit_button("Рассчитать")
+                if submitted:
+                    try:
+                        temp_value = predict_temperature_diameter_universal(universal_params, d_value, tau_value, GRAIN_SIZE_MM[float(grain_number)])
+                        st.metric("Расчетная температура по универсальной модели, °C", f"{temp_value:.4f}")
+                    except Exception as exc:
+                        st.error(f"Не удалось выполнить расчет по универсальной модели: {exc}")
             except Exception as exc:
                 st.error(f"Не удалось собрать универсальную модель по размеру зерна: {exc}")
 
@@ -1991,14 +2260,16 @@ with anchor_tab:
         st.write(
             "Подход повторяет универсальную модель роста диаметра: сначала строятся отдельные sigma-модели "
             "для каждого номера зерна, затем коэффициенты log(A), p и m выражаются через логарифм среднего размера зерна. "
-            "В этой версии для метамодели используются только зерна 8, 9 и 10, потому что модели для 3 и 5 оказались слабее."
+            "В этой версии для метамодели используются зерна 5, 8, 9 и 10. Для сравнения оставлены 4 варианта, "
+            "чтобы проверить, стоит ли фиксировать коэффициент m через среднее, медиану или взвешенное среднее."
         )
         try:
             cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
             sigma_variants = [
                 ("full", "Версия 1: A(dg), p(dg), m(dg)"),
-                ("m_const", "Версия 2: A(dg), p(dg), m=const"),
-                ("p_m_const", "Версия 3: A(dg), p=const, m=const"),
+                ("m_const_mean", "Версия 2: A(dg), p(dg), m=const (среднее)"),
+                ("m_const_median", "Версия 3: A(dg), p(dg), m=const (медиана)"),
+                ("m_const_weighted", "Версия 4: A(dg), p(dg), m=const (взвешенное)"),
             ]
             variant_results = []
             sigma_coeff_df = None
@@ -2046,7 +2317,7 @@ with anchor_tab:
                     }
                 )
             compare_df = pd.DataFrame(compare_rows)
-            st.subheader("Сравнение 3 версий универсальной sigma-модели")
+            st.subheader("Сравнение 4 версий универсальной sigma-модели")
             st.dataframe(compare_df, use_container_width=True, hide_index=True)
 
             best_idx = compare_df.sort_values(by=["RMSE по T, °C", "MAE по T, °C"], ascending=[True, True]).index[0]
@@ -2094,41 +2365,44 @@ with anchor_tab:
                 st.text(selected_variant["summary"])
 
             st.subheader("Калькулятор температуры по универсальной sigma-модели")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                sigma_tau_value = st.number_input(
-                    "Время наработки τ для универсальной sigma-модели",
-                    min_value=1e-9,
-                    value=1000.0,
-                    step=100.0,
-                    format="%.6f",
-                    key="sigma_universal_tau",
-                )
-            with c2:
-                sigma_value = st.number_input(
-                    "Содержание сигма-фазы cσ для универсальной модели, %",
-                    min_value=1e-9,
-                    value=1.0,
-                    step=0.1,
-                    format="%.6f",
-                    key="sigma_universal_sigma",
-                )
-            with c3:
-                sigma_grain_number = st.selectbox(
-                    "Номер зерна для универсальной sigma-модели",
-                    sorted(GRAIN_SIZE_MM.keys()),
-                    key="sigma_universal_grain",
-                )
-            try:
-                sigma_temp_value = predict_temperature_sigma_universal(
-                    selected_params,
-                    sigma_tau_value,
-                    sigma_value,
-                    GRAIN_SIZE_MM[float(sigma_grain_number)],
-                )
-                st.metric("Расчетная температура по универсальной sigma-модели, °C", f"{sigma_temp_value:.4f}")
-            except Exception as exc:
-                st.error(f"Не удалось выполнить расчет по универсальной sigma-модели: {exc}")
+            with st.form(key="sigma_universal_form"):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    sigma_tau_value = st.number_input(
+                        "Время наработки τ для универсальной sigma-модели",
+                        min_value=1.0,
+                        value=1000.0,
+                        step=1.0,
+                        format="%.0f",
+                        key="sigma_universal_tau",
+                    )
+                with c2:
+                    sigma_value = st.number_input(
+                        "Содержание сигма-фазы cσ для универсальной модели, %",
+                        min_value=0.01,
+                        value=1.0,
+                        step=0.01,
+                        format="%.2f",
+                        key="sigma_universal_sigma",
+                    )
+                with c3:
+                    sigma_grain_number = st.selectbox(
+                        "Номер зерна для универсальной sigma-модели",
+                        sorted(GRAIN_SIZE_MM.keys()),
+                        key="sigma_universal_grain",
+                    )
+                submitted = st.form_submit_button("Рассчитать")
+            if submitted:
+                try:
+                    sigma_temp_value = predict_temperature_sigma_universal(
+                        selected_params,
+                        sigma_tau_value,
+                        sigma_value,
+                        GRAIN_SIZE_MM[float(sigma_grain_number)],
+                    )
+                    st.metric("Расчетная температура по универсальной sigma-модели, °C", f"{sigma_temp_value:.4f}")
+                except Exception as exc:
+                    st.error(f"Не удалось выполнить расчет по универсальной sigma-модели: {exc}")
         except Exception as exc:
             st.error(f"Не удалось собрать универсальную sigma-модель по размеру зерна: {exc}")
 
@@ -2180,3 +2454,6 @@ with calculator_tab:
         st.error(f"Калькулятор sigma-модели по отдельным зернам недоступен: {anchor_error}")
     else:
         show_multi_calculator(base_result, improved_result, anchor_result)
+
+with universal_models_tab:
+    render_universal_models_tab(prepared_df, valid_grains)
