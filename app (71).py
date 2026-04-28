@@ -87,7 +87,7 @@ GRAIN_SIZE_MM = {
     10.0: 0.011,
 }
 
-SIGMA_UNIVERSAL_GRAINS = [5.0, 8.0, 9.0, 10.0]
+SIGMA_UNIVERSAL_GRAINS = [8.0, 9.0, 10.0]
 
 SCIENTIFIC_UNIVERSAL_SIGMA_PARAGRAPH = (
     "Универсализированная модель содержания σ-фазы по размеру зерна строится по наиболее надежной части "
@@ -1633,30 +1633,16 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
 
     try:
         cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
-        sigma_variants = [
-            ("full", "Версия 1: A(dg), p(dg), m(dg)"),
-            ("m_const_mean", "Версия 2: A(dg), p(dg), m=const (среднее)"),
-            ("m_const_median", "Версия 3: A(dg), p(dg), m=const (медиана)"),
-            ("m_const_weighted", "Версия 4: A(dg), p(dg), m=const (взвешенное)"),
-        ]
-        for variant_key, variant_title in sigma_variants:
-            params_item, coeff_df_item, summary_item = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant=variant_key)
-            eval_item = evaluate_sigma_universal_model(params_item, cleaned_sigma_results)
-            sigma_variants_payload.append(
-                {
-                    "key": variant_key,
-                    "title": variant_title,
-                    "params": params_item,
-                    "coeff_df": coeff_df_item,
-                    "summary": summary_item,
-                    "eval": eval_item,
-                }
-            )
-        if sigma_variants_payload:
-            selected_sigma_variant = min(
-                sigma_variants_payload,
-                key=lambda item: (item["eval"]["RMSE по T, °C"], item["eval"]["MAE по T, °C"]),
-            )
+        params_item, coeff_df_item, summary_item = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="m_const_median")
+        eval_item = evaluate_sigma_universal_model(params_item, cleaned_sigma_results)
+        selected_sigma_variant = {
+            "key": "m_const_median",
+            "title": "A(dg), p(dg), m=const (медиана)",
+            "params": params_item,
+            "coeff_df": coeff_df_item,
+            "summary": summary_item,
+            "eval": eval_item,
+        }
     except Exception as exc:
         sigma_error_local = str(exc)
 
@@ -1715,15 +1701,6 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         if selected_sigma_variant is None:
             st.error(f"Sigma-модель недоступна: {sigma_error_local}")
         else:
-            if len(sigma_variants_payload) > 1:
-                sigma_titles = [item["title"] for item in sigma_variants_payload]
-                selected_title = st.selectbox(
-                    "Выберите версию sigma-модели",
-                    sigma_titles,
-                    index=sigma_titles.index(selected_sigma_variant["title"]),
-                    key="universal_models_sigma_variant",
-                )
-                selected_sigma_variant = next(item for item in sigma_variants_payload if item["title"] == selected_title)
             p = selected_sigma_variant["params"]
             st.code(
                 "\n".join(
@@ -1740,7 +1717,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 st.text(selected_sigma_variant["summary"])
 
     st.subheader("Калькулятор по универсальным моделям")
-    st.caption("Введите либо процент σ-фазы, либо эквивалентный диаметр. Расчет запускается только по кнопке.")
+    st.caption("Можно ввести диаметр, процент σ-фазы или оба параметра сразу. Расчет запускается только по кнопке.")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         tau_value = st.number_input("Время наработки τ", min_value=1.0, value=1000.0, step=1.0, format="%.0f", key="universal_choice_tau")
@@ -1750,14 +1727,12 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         st.text_input(
             "Эквивалентный диаметр D, мкм",
             key="universal_choice_d",
-            on_change=clear_sigma_when_diameter_entered,
             placeholder="например, 7.25",
         )
     with c4:
         st.text_input(
             "Содержание σ-фазы, %",
             key="universal_choice_sigma",
-            on_change=clear_diameter_when_sigma_entered,
             placeholder="например, 4.50",
         )
 
@@ -1765,19 +1740,31 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         try:
             diameter_value = parse_optional_float(st.session_state.get("universal_choice_d", ""))
             sigma_value = parse_optional_float(st.session_state.get("universal_choice_sigma", ""))
-            if (diameter_value is None and sigma_value is None) or (diameter_value is not None and sigma_value is not None):
-                raise ValueError("Нужно заполнить только одно поле: либо диаметр, либо процент σ-фазы.")
+            if diameter_value is None and sigma_value is None:
+                raise ValueError("Нужно заполнить хотя бы одно поле: диаметр и/или процент σ-фазы.")
             grain_size = GRAIN_SIZE_MM[float(grain_number)]
+            result_rows = []
             if diameter_value is not None:
                 if diameter_payload is None:
                     raise ValueError(diameter_error_local or "Универсальная модель диаметра недоступна.")
-                temp_value = predict_temperature_diameter_universal(diameter_payload["params"], round(diameter_value, 2), tau_value, grain_size)
-                st.success(f"Расчет по универсальной модели диаметра: {temp_value:.4f} °C")
-            else:
+                temp_d = predict_temperature_diameter_universal(diameter_payload["params"], round(diameter_value, 2), tau_value, grain_size)
+                result_rows.append({"Модель": "Универсальная модель диаметра", "Расчетная температура, °C": temp_d})
+            if sigma_value is not None:
                 if selected_sigma_variant is None:
                     raise ValueError(sigma_error_local or "Универсальная sigma-модель недоступна.")
-                temp_value = predict_temperature_sigma_universal(selected_sigma_variant["params"], tau_value, round(sigma_value, 2), grain_size)
-                st.success(f"Расчет по универсальной sigma-модели: {temp_value:.4f} °C")
+                temp_sigma = predict_temperature_sigma_universal(selected_sigma_variant["params"], tau_value, round(sigma_value, 2), grain_size)
+                result_rows.append({"Модель": "Универсальная sigma-модель", "Расчетная температура, °C": temp_sigma})
+
+            if len(result_rows) == 1:
+                row = result_rows[0]
+                st.success(f"{row['Модель']}: {row['Расчетная температура, °C']:.4f} °C")
+            else:
+                c_res1, c_res2 = st.columns(2)
+                with c_res1:
+                    st.metric("Температура по универсальной модели диаметра, °C", f"{result_rows[0]['Расчетная температура, °C']:.4f}")
+                with c_res2:
+                    st.metric("Температура по универсальной sigma-модели, °C", f"{result_rows[1]['Расчетная температура, °C']:.4f}")
+            st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
         except Exception as exc:
             st.error(f"Не удалось выполнить расчет: {exc}")
 
@@ -2259,35 +2246,14 @@ with anchor_tab:
         st.subheader("Универсальная sigma-модель по размеру зерна")
         st.write(
             "Подход повторяет универсальную модель роста диаметра: сначала строятся отдельные sigma-модели "
-            "для каждого номера зерна, затем коэффициенты log(A), p и m выражаются через логарифм среднего размера зерна. "
-            "В этой версии для метамодели используются зерна 5, 8, 9 и 10. Для сравнения оставлены 4 варианта, "
-            "чтобы проверить, стоит ли фиксировать коэффициент m через среднее, медиану или взвешенное среднее."
+            "для каждого номера зерна, затем коэффициенты log(A) и p выражаются через логарифм среднего размера зерна. "
+            "В общую sigma-модель включены только зерна 8, 9 и 10, а коэффициент m фиксирован как константа по медиане, "
+            "потому что такой вариант устойчивее к шуму и не даёт зерну 5 портить общую зависимость."
         )
         try:
             cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
-            sigma_variants = [
-                ("full", "Версия 1: A(dg), p(dg), m(dg)"),
-                ("m_const_mean", "Версия 2: A(dg), p(dg), m=const (среднее)"),
-                ("m_const_median", "Версия 3: A(dg), p(dg), m=const (медиана)"),
-                ("m_const_weighted", "Версия 4: A(dg), p(dg), m=const (взвешенное)"),
-            ]
-            variant_results = []
-            sigma_coeff_df = None
-            for variant_key, variant_title in sigma_variants:
-                params_item, coeff_df_item, summary_item = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant=variant_key)
-                eval_item = evaluate_sigma_universal_model(params_item, cleaned_sigma_results)
-                variant_results.append(
-                    {
-                        "key": variant_key,
-                        "title": variant_title,
-                        "params": params_item,
-                        "coeff_df": coeff_df_item,
-                        "summary": summary_item,
-                        "eval": eval_item,
-                    }
-                )
-                if sigma_coeff_df is None:
-                    sigma_coeff_df = coeff_df_item
+            selected_params, sigma_coeff_df, sigma_summary = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="m_const_median")
+            sigma_eval = evaluate_sigma_universal_model(selected_params, cleaned_sigma_results)
 
             coeff_view = sigma_coeff_df[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].copy()
             coeff_view = coeff_view.rename(
@@ -2301,49 +2267,20 @@ with anchor_tab:
                 }
             )
             st.dataframe(coeff_view, use_container_width=True, hide_index=True)
-            compare_rows = []
-            for item in variant_results:
-                compare_rows.append(
-                    {
-                        "Версия": item["title"],
-                        "R² для log(A)(dg)": item["params"]["r2_log_a"],
-                        "R² для p(dg)": item["params"]["r2_p"],
-                        "R² для m(dg)": item["params"]["r2_m"],
-                        "R² по T": item["eval"]["R² по T"],
-                        "RMSE по T, °C": item["eval"]["RMSE по T, °C"],
-                        "MAE по T, °C": item["eval"]["MAE по T, °C"],
-                        "MAPE по T, %": item["eval"]["MAPE по T, %"],
-                        "Количество точек": item["eval"]["Количество точек"],
-                    }
-                )
-            compare_df = pd.DataFrame(compare_rows)
-            st.subheader("Сравнение 4 версий универсальной sigma-модели")
-            st.dataframe(compare_df, use_container_width=True, hide_index=True)
 
-            best_idx = compare_df.sort_values(by=["RMSE по T, °C", "MAE по T, °C"], ascending=[True, True]).index[0]
-            best_variant = variant_results[int(best_idx)]
             st.info(
-                f"Сейчас лучшая версия по RMSE температуры: {best_variant['title']} "
-                f"(RMSE={best_variant['eval']['RMSE по T, °C']:.4f} °C, R²={best_variant['eval']['R² по T']:.4f})."
+                f"Для общей sigma-модели используются только зерна 8, 9 и 10. Текущий вариант: m = const по медиане. "
+                f"RMSE={sigma_eval['RMSE по T, °C']:.4f} °C, R²={sigma_eval['R² по T']:.4f}."
             )
-
-            selected_variant_title = st.selectbox(
-                "Выберите версию универсальной sigma-модели для подробного просмотра",
-                [item["title"] for item in variant_results],
-                index=int(best_idx),
-                key="sigma_universal_variant_select",
-            )
-            selected_variant = next(item for item in variant_results if item["title"] == selected_variant_title)
-            selected_params = selected_variant["params"]
 
             st.code(
                 "\n".join(
                     [
                         f"log(A)(dg) = {selected_params['alpha0']:.8f} + ({selected_params['alpha1']:.8f}) · ln(dg)",
                         f"p(dg) = {selected_params['beta0']:.8f} + ({selected_params['beta1']:.8f}) · ln(dg)",
-                        f"m(dg) = {selected_params['gamma0']:.8f} + ({selected_params['gamma1']:.8f}) · ln(dg)",
+                        f"m = {selected_params['gamma0']:.8f}",
                         "",
-                        "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)",
+                        "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m",
                     ]
                 ),
                 language="text",
@@ -2353,16 +2290,15 @@ with anchor_tab:
                     {
                         "R² для log(A)(dg)": selected_params["r2_log_a"],
                         "R² для p(dg)": selected_params["r2_p"],
-                        "R² для m(dg)": selected_params["r2_m"],
-                        "R² по T": selected_variant["eval"]["R² по T"],
-                        "RMSE по T, °C": selected_variant["eval"]["RMSE по T, °C"],
+                        "R² по T": sigma_eval["R² по T"],
+                        "RMSE по T, °C": sigma_eval["RMSE по T, °C"],
                         "Количество зерновых моделей": float(len(sigma_coeff_df)),
                     }
                 ]
             )
             st.dataframe(meta_quality_df, use_container_width=True, hide_index=True)
-            with st.expander("Сводка по выбранной универсальной sigma-модели"):
-                st.text(selected_variant["summary"])
+            with st.expander("Сводка по универсальной sigma-модели"):
+                st.text(sigma_summary)
 
             st.subheader("Калькулятор температуры по универсальной sigma-модели")
             with st.form(key="sigma_universal_form"):
