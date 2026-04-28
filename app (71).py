@@ -87,6 +87,8 @@ GRAIN_SIZE_MM = {
     10.0: 0.011,
 }
 
+SIGMA_UNIVERSAL_GRAINS = [8.0, 9.0, 10.0]
+
 
 @dataclass
 class FitResult:
@@ -1205,6 +1207,8 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
 def fit_sigma_universal_grain_size_model(cleaned_results: dict[float, FitResult]) -> tuple[dict[str, float], pd.DataFrame, str]:
     rows: list[dict[str, float]] = []
     for grain, result in cleaned_results.items():
+        if float(grain) not in SIGMA_UNIVERSAL_GRAINS:
+            continue
         grain_size = GRAIN_SIZE_MM.get(float(grain))
         if grain_size is None:
             continue
@@ -1223,7 +1227,7 @@ def fit_sigma_universal_grain_size_model(cleaned_results: dict[float, FitResult]
         )
     coeff_df = pd.DataFrame(rows).dropna()
     if len(coeff_df) < 3:
-        raise ValueError("Для универсальной sigma-модели нужно минимум 3 очищенные зерновые модели с известным размером зерна.")
+        raise ValueError("Для универсальной sigma-модели по зернам 8, 9 и 10 нужны 3 очищенные зерновые модели с известным размером зерна.")
 
     X = sm.add_constant(coeff_df[["ln_grain_size"]])
     model_log_a = sm.OLS(coeff_df["log_a"], X).fit()
@@ -1242,7 +1246,7 @@ def fit_sigma_universal_grain_size_model(cleaned_results: dict[float, FitResult]
         "r2_m": float(model_m.rsquared),
     }
     summary_text = (
-        "Метамодель коэффициентов очищенных sigma-моделей по размеру зерна.\n\n"
+        "Метамодель коэффициентов очищенных sigma-моделей по размеру зерна только для зерен 8, 9 и 10.\n\n"
         f"log(A)(dg)=alpha0+alpha1·ln(dg), R²={model_log_a.rsquared:.4f}\n"
         f"p(dg)=beta0+beta1·ln(dg), R²={model_p.rsquared:.4f}\n"
         f"m(dg)=gamma0+gamma1·ln(dg), R²={model_m.rsquared:.4f}\n\n"
@@ -1927,7 +1931,8 @@ with anchor_tab:
         st.subheader("Универсальная sigma-модель по размеру зерна")
         st.write(
             "Подход повторяет универсальную модель роста диаметра: сначала строятся отдельные sigma-модели "
-            "для каждого номера зерна, затем коэффициенты log(A), p и m выражаются через логарифм среднего размера зерна."
+            "для каждого номера зерна, затем коэффициенты log(A), p и m выражаются через логарифм среднего размера зерна. "
+            "В этой версии для метамодели используются только зерна 8, 9 и 10, потому что модели для 3 и 5 оказались слабее."
         )
         try:
             cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
