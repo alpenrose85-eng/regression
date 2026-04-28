@@ -1208,16 +1208,20 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
     model_b = sm.OLS(coeff_df["b"], X).fit()
     model_c = sm.OLS(coeff_df["c"], X).fit()
 
+    params_a = np.asarray(model_a.params, dtype=float)
+    params_b = np.asarray(model_b.params, dtype=float)
+    params_c = np.asarray(model_c.params, dtype=float)
+
     params = {
-        "alpha0": float(model_a.params[0]),
-        "alpha1": float(model_a.params[1]),
-        "alpha2": float(model_a.params[2]),
-        "beta0": float(model_b.params[0]),
-        "beta1": float(model_b.params[1]),
-        "beta2": float(model_b.params[2]),
-        "gamma0": float(model_c.params[0]),
-        "gamma1": float(model_c.params[1]),
-        "gamma2": float(model_c.params[2]),
+        "alpha0": float(params_a[0]),
+        "alpha1": float(params_a[1]),
+        "alpha2": float(params_a[2]),
+        "beta0": float(params_b[0]),
+        "beta1": float(params_b[1]),
+        "beta2": float(params_b[2]),
+        "gamma0": float(params_c[0]),
+        "gamma1": float(params_c[1]),
+        "gamma2": float(params_c[2]),
         "r2_a": float(model_a.rsquared),
         "r2_b": float(model_b.rsquared),
         "r2_c": float(model_c.rsquared),
@@ -1270,8 +1274,9 @@ def analyze_coefficient_forms(coeff_df: pd.DataFrame, coeff_name: str) -> pd.Dat
             "Форма": label,
             "R²": float(model.rsquared),
         }
+        params_arr = np.asarray(model.params, dtype=float)
         for idx, name in enumerate(names):
-            row[name] = float(model.params[idx])
+            row[name] = float(params_arr[idx])
         rows.append(row)
     return pd.DataFrame(rows).sort_values(by=["R²", "Форма"], ascending=[False, True]).reset_index(drop=True)
 
