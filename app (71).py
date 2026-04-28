@@ -1204,7 +1204,10 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
     return params, coeff_df, summary_text
 
 
-def fit_sigma_universal_grain_size_model(cleaned_results: dict[float, FitResult]) -> tuple[dict[str, float], pd.DataFrame, str]:
+def fit_sigma_universal_grain_size_model(
+    cleaned_results: dict[float, FitResult],
+    variant: str = "full",
+) -> tuple[dict[str, float], pd.DataFrame, str]:
     rows: list[dict[str, float]] = []
     for grain, result in cleaned_results.items():
         if float(grain) not in SIGMA_UNIVERSAL_GRAINS:
@@ -1231,25 +1234,54 @@ def fit_sigma_universal_grain_size_model(cleaned_results: dict[float, FitResult]
 
     X = sm.add_constant(coeff_df[["ln_grain_size"]])
     model_log_a = sm.OLS(coeff_df["log_a"], X).fit()
-    model_p = sm.OLS(coeff_df["p_exp"], X).fit()
-    model_m = sm.OLS(coeff_df["m_exp"], X).fit()
+
+    if variant == "full":
+        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
+        model_m = sm.OLS(coeff_df["m_exp"], X).fit()
+        beta0 = float(model_p.params.get("const", np.nan))
+        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
+        gamma0 = float(model_m.params.get("const", np.nan))
+        gamma1 = float(model_m.params.get("ln_grain_size", np.nan))
+        variant_label = "A(dg), p(dg), m(dg)"
+    elif variant == "m_const":
+        model_p = sm.OLS(coeff_df["p_exp"], X).fit()
+        model_m = None
+        beta0 = float(model_p.params.get("const", np.nan))
+        beta1 = float(model_p.params.get("ln_grain_size", np.nan))
+        gamma0 = float(coeff_df["m_exp"].mean())
+        gamma1 = 0.0
+        variant_label = "A(dg), p(dg), m=const"
+    elif variant == "p_m_const":
+        model_p = None
+        model_m = None
+        beta0 = float(coeff_df["p_exp"].mean())
+        beta1 = 0.0
+        gamma0 = float(coeff_df["m_exp"].mean())
+        gamma1 = 0.0
+        variant_label = "A(dg), p=const, m=const"
+    else:
+        raise ValueError(f"Неизвестный вариант sigma-метамодели: {variant}")
 
     params = {
         "alpha0": float(model_log_a.params.get("const", np.nan)),
         "alpha1": float(model_log_a.params.get("ln_grain_size", np.nan)),
-        "beta0": float(model_p.params.get("const", np.nan)),
-        "beta1": float(model_p.params.get("ln_grain_size", np.nan)),
-        "gamma0": float(model_m.params.get("const", np.nan)),
-        "gamma1": float(model_m.params.get("ln_grain_size", np.nan)),
+        "beta0": beta0,
+        "beta1": beta1,
+        "gamma0": gamma0,
+        "gamma1": gamma1,
         "r2_log_a": float(model_log_a.rsquared),
-        "r2_p": float(model_p.rsquared),
-        "r2_m": float(model_m.rsquared),
+        "r2_p": float(model_p.rsquared) if model_p is not None else np.nan,
+        "r2_m": float(model_m.rsquared) if model_m is not None else np.nan,
+        "variant": variant,
+        "variant_label": variant_label,
     }
+    p_text = f"p(dg)=beta0+beta1·ln(dg), R²={model_p.rsquared:.4f}" if model_p is not None and beta1 != 0.0 else f"p=const={beta0:.8f}"
+    m_text = f"m(dg)=gamma0+gamma1·ln(dg), R²={model_m.rsquared:.4f}" if model_m is not None and gamma1 != 0.0 else f"m=const={gamma0:.8f}"
     summary_text = (
-        "Метамодель коэффициентов очищенных sigma-моделей по размеру зерна только для зерен 8, 9 и 10.\n\n"
+        f"Метамодель коэффициентов очищенных sigma-моделей по размеру зерна только для зерен 8, 9 и 10. Вариант: {variant_label}.\n\n"
         f"log(A)(dg)=alpha0+alpha1·ln(dg), R²={model_log_a.rsquared:.4f}\n"
-        f"p(dg)=beta0+beta1·ln(dg), R²={model_p.rsquared:.4f}\n"
-        f"m(dg)=gamma0+gamma1·ln(dg), R²={model_m.rsquared:.4f}\n\n"
+        f"{p_text}\n"
+        f"{m_text}\n\n"
         "Итоговая универсальная форма:\n"
         "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)"
     )
@@ -1285,6 +1317,33 @@ def predict_temperature_sigma_universal(params: dict[str, float], tau: float, c_
         raise ValueError("Универсальная sigma-модель дала некорректный множитель A·τ^p.")
     temp_norm = np.power(max(c_sigma / denom, 1e-12), 1.0 / m_exp)
     return float(np.clip(550.0 + 350.0 * temp_norm, 550.0, 900.0))
+
+
+def evaluate_sigma_universal_model(params: dict[str, float], cleaned_results: dict[float, FitResult]) -> dict[str, float]:
+    rows: list[dict[str, float]] = []
+    for grain, result in cleaned_results.items():
+        if float(grain) not in SIGMA_UNIVERSAL_GRAINS:
+            continue
+        grain_size = GRAIN_SIZE_MM.get(float(grain))
+        if grain_size is None:
+            continue
+        df = result.data.copy()
+        df["T_pred_universal"] = df.apply(
+            lambda row: predict_temperature_sigma_universal(params, float(row["tau"]), float(row["c_sigma"]), grain_size),
+            axis=1,
+        )
+        rows.append(df)
+    if not rows:
+        raise ValueError("Нет данных для оценки универсальной sigma-модели.")
+    eval_df = pd.concat(rows, ignore_index=True)
+    errors = eval_df["T"] - eval_df["T_pred_universal"]
+    return {
+        "Количество точек": float(len(eval_df)),
+        "R² по T": float(r2_score(eval_df["T"], eval_df["T_pred_universal"])) if len(eval_df) >= 2 else np.nan,
+        "RMSE по T, °C": float(np.sqrt(mean_squared_error(eval_df["T"], eval_df["T_pred_universal"]))),
+        "MAE по T, °C": float(mean_absolute_error(eval_df["T"], eval_df["T_pred_universal"])),
+        "MAPE по T, %": float(np.mean(np.abs(errors) / np.maximum(np.abs(eval_df["T"]), 1e-9)) * 100.0),
+    }
 
 
 def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
@@ -1936,7 +1995,29 @@ with anchor_tab:
         )
         try:
             cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
-            universal_sigma_params, sigma_coeff_df, sigma_universal_summary = fit_sigma_universal_grain_size_model(cleaned_sigma_results)
+            sigma_variants = [
+                ("full", "Версия 1: A(dg), p(dg), m(dg)"),
+                ("m_const", "Версия 2: A(dg), p(dg), m=const"),
+                ("p_m_const", "Версия 3: A(dg), p=const, m=const"),
+            ]
+            variant_results = []
+            sigma_coeff_df = None
+            for variant_key, variant_title in sigma_variants:
+                params_item, coeff_df_item, summary_item = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant=variant_key)
+                eval_item = evaluate_sigma_universal_model(params_item, cleaned_sigma_results)
+                variant_results.append(
+                    {
+                        "key": variant_key,
+                        "title": variant_title,
+                        "params": params_item,
+                        "coeff_df": coeff_df_item,
+                        "summary": summary_item,
+                        "eval": eval_item,
+                    }
+                )
+                if sigma_coeff_df is None:
+                    sigma_coeff_df = coeff_df_item
+
             coeff_view = sigma_coeff_df[["G", "grain_size_mm", "log_a", "p_exp", "m_exp", "R²", "RMSE_sigma"]].copy()
             coeff_view = coeff_view.rename(
                 columns={
@@ -1949,12 +2030,47 @@ with anchor_tab:
                 }
             )
             st.dataframe(coeff_view, use_container_width=True, hide_index=True)
+            compare_rows = []
+            for item in variant_results:
+                compare_rows.append(
+                    {
+                        "Версия": item["title"],
+                        "R² для log(A)(dg)": item["params"]["r2_log_a"],
+                        "R² для p(dg)": item["params"]["r2_p"],
+                        "R² для m(dg)": item["params"]["r2_m"],
+                        "R² по T": item["eval"]["R² по T"],
+                        "RMSE по T, °C": item["eval"]["RMSE по T, °C"],
+                        "MAE по T, °C": item["eval"]["MAE по T, °C"],
+                        "MAPE по T, %": item["eval"]["MAPE по T, %"],
+                        "Количество точек": item["eval"]["Количество точек"],
+                    }
+                )
+            compare_df = pd.DataFrame(compare_rows)
+            st.subheader("Сравнение 3 версий универсальной sigma-модели")
+            st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+            best_idx = compare_df.sort_values(by=["RMSE по T, °C", "MAE по T, °C"], ascending=[True, True]).index[0]
+            best_variant = variant_results[int(best_idx)]
+            st.info(
+                f"Сейчас лучшая версия по RMSE температуры: {best_variant['title']} "
+                f"(RMSE={best_variant['eval']['RMSE по T, °C']:.4f} °C, R²={best_variant['eval']['R² по T']:.4f})."
+            )
+
+            selected_variant_title = st.selectbox(
+                "Выберите версию универсальной sigma-модели для подробного просмотра",
+                [item["title"] for item in variant_results],
+                index=int(best_idx),
+                key="sigma_universal_variant_select",
+            )
+            selected_variant = next(item for item in variant_results if item["title"] == selected_variant_title)
+            selected_params = selected_variant["params"]
+
             st.code(
                 "\n".join(
                     [
-                        f"log(A)(dg) = {universal_sigma_params['alpha0']:.8f} + ({universal_sigma_params['alpha1']:.8f}) · ln(dg)",
-                        f"p(dg) = {universal_sigma_params['beta0']:.8f} + ({universal_sigma_params['beta1']:.8f}) · ln(dg)",
-                        f"m(dg) = {universal_sigma_params['gamma0']:.8f} + ({universal_sigma_params['gamma1']:.8f}) · ln(dg)",
+                        f"log(A)(dg) = {selected_params['alpha0']:.8f} + ({selected_params['alpha1']:.8f}) · ln(dg)",
+                        f"p(dg) = {selected_params['beta0']:.8f} + ({selected_params['beta1']:.8f}) · ln(dg)",
+                        f"m(dg) = {selected_params['gamma0']:.8f} + ({selected_params['gamma1']:.8f}) · ln(dg)",
                         "",
                         "cσ = A(dg) · τ^p(dg) · ((T - 550) / 350)^m(dg)",
                     ]
@@ -1964,16 +2080,18 @@ with anchor_tab:
             meta_quality_df = pd.DataFrame(
                 [
                     {
-                        "R² для log(A)(dg)": universal_sigma_params["r2_log_a"],
-                        "R² для p(dg)": universal_sigma_params["r2_p"],
-                        "R² для m(dg)": universal_sigma_params["r2_m"],
+                        "R² для log(A)(dg)": selected_params["r2_log_a"],
+                        "R² для p(dg)": selected_params["r2_p"],
+                        "R² для m(dg)": selected_params["r2_m"],
+                        "R² по T": selected_variant["eval"]["R² по T"],
+                        "RMSE по T, °C": selected_variant["eval"]["RMSE по T, °C"],
                         "Количество зерновых моделей": float(len(sigma_coeff_df)),
                     }
                 ]
             )
             st.dataframe(meta_quality_df, use_container_width=True, hide_index=True)
-            with st.expander("Сводка по универсальной sigma-модели"):
-                st.text(sigma_universal_summary)
+            with st.expander("Сводка по выбранной универсальной sigma-модели"):
+                st.text(selected_variant["summary"])
 
             st.subheader("Калькулятор температуры по универсальной sigma-модели")
             c1, c2, c3 = st.columns(3)
@@ -2003,7 +2121,7 @@ with anchor_tab:
                 )
             try:
                 sigma_temp_value = predict_temperature_sigma_universal(
-                    universal_sigma_params,
+                    selected_params,
                     sigma_tau_value,
                     sigma_value,
                     GRAIN_SIZE_MM[float(sigma_grain_number)],
