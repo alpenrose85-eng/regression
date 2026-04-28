@@ -976,6 +976,21 @@ def sigma_vs_time_plot(df: pd.DataFrame, title: str) -> None:
     plt.close(fig)
 
 
+def sigma_model_points_plot(df: pd.DataFrame, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sorted_df = df.sort_values("T")
+    point_index = np.arange(1, len(sorted_df) + 1)
+    ax.plot(point_index, sorted_df["sigma_pred_pct"], color="#9467bd", linewidth=2, marker="o", label="Модель")
+    ax.scatter(point_index, sorted_df["c_sigma"], color="#1f77b4", s=55, label="Эксперимент")
+    ax.set_xlabel("Номер точки в порядке возрастания температуры")
+    ax.set_ylabel("Содержание сигма-фазы cσ, %")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
 def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
     st.subheader(f"Sigma-модель для номера зерна {grain_value}")
     st.caption("Сначала показана предсказательность модели по температуре, ниже — качество прямой подгонки по содержанию сигма-фазы.")
@@ -1057,6 +1072,7 @@ def show_sigma_grain_block(result: FitResult, grain_value: float) -> None:
             result.data.assign(T_pred=result.data["sigma_pred_pct"], error_celsius=result.data["c_sigma"] - result.data["sigma_pred_pct"]),
             "Остатки по cσ",
         )
+    sigma_model_points_plot(result.data, "Модель и экспериментальные точки")
     with st.expander("Подробная статистическая сводка"):
         st.text(result.model_summary)
 
