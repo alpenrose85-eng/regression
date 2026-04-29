@@ -1734,6 +1734,16 @@ def build_grain_size_mapping_df(valid_grains: list[float] | None = None) -> pd.D
     return pd.DataFrame(rows)
 
 
+def grain_mapping_caption(valid_grains: list[float] | None = None) -> str:
+    grains = sorted(valid_grains) if valid_grains else sorted(GRAIN_SIZE_MM.keys())
+    parts = []
+    for grain in grains:
+        dg = GRAIN_SIZE_MM.get(float(grain), np.nan)
+        if is_finite_number(dg):
+            parts.append(f"G={int(grain) if float(grain).is_integer() else grain} → d_g={fmt_trimmed(dg, 3)} мм")
+    return "; ".join(parts)
+
+
 def build_sigma_grain_report(cleaned_sigma_results: dict[float, FitResult]) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     for grain in sorted(cleaned_sigma_results.keys()):
@@ -2021,6 +2031,7 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
 
     st.markdown("**2а. Соответствие номера зерна G и размера зерна d_g**")
     st.dataframe(grain_size_mapping_df, use_container_width=True, hide_index=True)
+    st.caption(grain_mapping_caption(valid_grains))
 
     st.markdown("**3. Локальные sigma-модели по зернам**")
     st.dataframe(sigma_grain_df_fmt, use_container_width=True, hide_index=True)
@@ -2260,6 +2271,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
     st.markdown("**Соответствие номера зерна и физического размера зерна**")
     st.caption("В универсальных моделях в коэффициенты подставляется не номер зерна G напрямую, а соответствующий ему физический размер зерна d_g.")
     st.dataframe(build_grain_size_mapping_df(valid_grains), use_container_width=True, hide_index=True)
+    st.info(grain_mapping_caption(valid_grains))
 
     recommended_diameter_exclusions = get_recommended_diameter_exclusions(prepared_df, valid_grains)
     recommended_sigma_exclusions = get_recommended_sigma_exclusions(prepared_df, valid_grains)
@@ -2408,6 +2420,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
 
     st.subheader("Калькулятор по универсальным моделям")
     st.caption("Можно ввести диаметр, процент σ-фазы или оба параметра сразу. Расчет запускается только по кнопке.")
+    st.caption(f"Соответствие для расчета: {grain_mapping_caption(valid_grains)}")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         tau_value = st.number_input("Время наработки τ", min_value=1.0, value=1000.0, step=1.0, format="%.0f", key="universal_choice_tau")
