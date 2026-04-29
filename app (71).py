@@ -1573,6 +1573,66 @@ def round_if_present(df: pd.DataFrame, columns: list[str], decimals: int) -> pd.
     return view
 
 
+def format_columns_as_strings(df: pd.DataFrame, columns: list[str], decimals: int) -> pd.DataFrame:
+    view = df.copy()
+    for col in columns:
+        if col in view.columns:
+            numeric = pd.to_numeric(view[col], errors="coerce")
+            view[col] = numeric.apply(lambda x: "" if pd.isna(x) else f"{float(x):.{decimals}f}")
+    return view
+
+
+def make_export_friendly_tables(
+    dataset_summary_df: pd.DataFrame,
+    dataset_by_grain_df: pd.DataFrame,
+    sigma_grain_df: pd.DataFrame,
+    sigma_universal_df: pd.DataFrame,
+    diameter_grain_df: pd.DataFrame,
+    diameter_universal_df: pd.DataFrame,
+    sigma_rounding_df: pd.DataFrame,
+    diameter_rounding_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    summary_fmt = format_columns_as_strings(dataset_summary_df, ["T_min, °C", "T_max, °C", "cσ_min, %", "cσ_max, %", "D_min", "D_max"], 2)
+    by_grain_fmt = format_columns_as_strings(dataset_by_grain_df, ["T_min, °C", "T_max, °C", "cσ_min, %", "cσ_max, %", "D_min", "D_max"], 2)
+
+    sigma_grain_fmt = format_columns_as_strings(
+        sigma_grain_df,
+        ["Размер зерна, мм", "log(A)", "p", "m", "R² по T", "R² по cσ", "RMSE по cσ, %", "MAE по cσ, %", "MAPE по cσ, %"],
+        2,
+    )
+    sigma_grain_fmt = format_columns_as_strings(sigma_grain_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %"], 0)
+
+    sigma_universal_fmt = format_columns_as_strings(
+        sigma_universal_df,
+        ["alpha0", "alpha1", "alpha2", "p", "m", "R² для log(A)(dg)", "R² по T"],
+        2,
+    )
+    sigma_universal_fmt = format_columns_as_strings(sigma_universal_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %"], 0)
+
+    diameter_grain_fmt = format_columns_as_strings(
+        diameter_grain_df,
+        ["Размер зерна, мм", "a", "b", "c", "R² по T"],
+        2,
+    )
+    diameter_grain_fmt = format_columns_as_strings(diameter_grain_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %"], 0)
+
+    diameter_universal_fmt = format_columns_as_strings(
+        diameter_universal_df,
+        ["alpha0", "alpha1", "alpha2", "beta0", "beta1", "beta2", "gamma0", "gamma1", "gamma2"],
+        4,
+    )
+    diameter_universal_fmt = format_columns_as_strings(diameter_universal_fmt, ["R² для a(dg)", "R² для b(dg)", "R² для c(dg)", "R² по T"], 2)
+    diameter_universal_fmt = format_columns_as_strings(diameter_universal_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %"], 0)
+
+    sigma_rounding_fmt = format_columns_as_strings(sigma_rounding_df, ["R² по T", "ΔR²"], 2)
+    sigma_rounding_fmt = format_columns_as_strings(sigma_rounding_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %", "ΔRMSE, °C", "ΔMAE, °C", "ΔMAPE, %"], 0)
+
+    diameter_rounding_fmt = format_columns_as_strings(diameter_rounding_df, ["R² по T", "ΔR²"], 2)
+    diameter_rounding_fmt = format_columns_as_strings(diameter_rounding_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %", "ΔRMSE, °C", "ΔMAE, °C", "ΔMAPE, %"], 0)
+
+    return summary_fmt, by_grain_fmt, sigma_grain_fmt, sigma_universal_fmt, diameter_grain_fmt, diameter_universal_fmt, sigma_rounding_fmt, diameter_rounding_fmt
+
+
 def format_report_tables(
     sigma_grain_df: pd.DataFrame,
     sigma_universal_df: pd.DataFrame,
@@ -1746,6 +1806,14 @@ def rounded_copy(params: dict[str, float], decimals: int, keys: list[str]) -> di
     return rounded
 
 
+def get_final_sigma_params(params: dict[str, float]) -> dict[str, float]:
+    return rounded_copy(params, 2, ["alpha0", "alpha1", "alpha2", "p_const", "m_const"])
+
+
+def get_final_diameter_params(params: dict[str, float]) -> dict[str, float]:
+    return rounded_copy(params, 4, ["alpha0", "alpha1", "alpha2", "beta0", "beta1", "beta2", "gamma0", "gamma1", "gamma2"])
+
+
 def build_sigma_rounding_analysis(params: dict[str, float], cleaned_sigma_results: dict[float, FitResult]) -> pd.DataFrame:
     base_eval = evaluate_sigma_universal_model(params, cleaned_sigma_results)
     rows: list[dict[str, float]] = [
@@ -1831,7 +1899,8 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
     sigma_grain_df = build_sigma_grain_report(cleaned_sigma_results)
     diameter_grain_df = build_diameter_grain_report(cleaned_diameter_results)
 
-    sigma_params, _, _ = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="median_constants")
+    sigma_params_raw, _, _ = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="median_constants")
+    sigma_params = get_final_sigma_params(sigma_params_raw)
     sigma_eval = evaluate_sigma_universal_model(sigma_params, cleaned_sigma_results)
     sigma_universal_df = pd.DataFrame(
         [
@@ -1853,7 +1922,8 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
         ]
     )
 
-    diameter_params, _, _ = fit_diameter_universal_grain_size_model(cleaned_diameter_results, variant="quadratic_full")
+    diameter_params_raw, _, _ = fit_diameter_universal_grain_size_model(cleaned_diameter_results, variant="quadratic_full")
+    diameter_params = get_final_diameter_params(diameter_params_raw)
     diameter_eval = evaluate_diameter_universal_model(diameter_params, cleaned_diameter_results)
     diameter_universal_df = pd.DataFrame(
         [
@@ -1881,8 +1951,8 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
         ]
     )
 
-    sigma_rounding_df = build_sigma_rounding_analysis(sigma_params, cleaned_sigma_results)
-    diameter_rounding_df = build_diameter_rounding_analysis(diameter_params, cleaned_diameter_results)
+    sigma_rounding_df = build_sigma_rounding_analysis(sigma_params_raw, cleaned_sigma_results)
+    diameter_rounding_df = build_diameter_rounding_analysis(diameter_params_raw, cleaned_diameter_results)
     (
         sigma_grain_df_fmt,
         sigma_universal_df_fmt,
@@ -1897,6 +1967,25 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
         diameter_universal_df,
         sigma_rounding_df,
         diameter_rounding_df,
+    )
+    (
+        dataset_summary_export,
+        dataset_by_grain_export,
+        sigma_grain_export,
+        sigma_universal_export,
+        diameter_grain_export,
+        diameter_universal_export,
+        sigma_rounding_export,
+        diameter_rounding_export,
+    ) = make_export_friendly_tables(
+        dataset_summary_df,
+        dataset_by_grain_df,
+        sigma_grain_df_fmt,
+        sigma_universal_df_fmt,
+        diameter_grain_df_fmt,
+        diameter_universal_df_fmt,
+        sigma_rounding_df_fmt,
+        diameter_rounding_df_fmt,
     )
 
     st.markdown("**1. Общая сводка по выборке**")
@@ -1926,14 +2015,14 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
     st.dataframe(diameter_rounding_df_fmt, use_container_width=True, hide_index=True)
 
     export_text = build_report_export_text(
-        dataset_summary_df,
-        dataset_by_grain_df,
-        sigma_grain_df_fmt,
-        sigma_universal_df_fmt,
-        diameter_grain_df_fmt,
-        diameter_universal_df_fmt,
-        sigma_rounding_df_fmt,
-        diameter_rounding_df_fmt,
+        dataset_summary_export,
+        dataset_by_grain_export,
+        sigma_grain_export,
+        sigma_universal_export,
+        diameter_grain_export,
+        diameter_universal_export,
+        sigma_rounding_export,
+        diameter_rounding_export,
     )
     with st.expander("Текстовый экспорт для ассистента"):
         st.caption("Этот блок можно целиком скопировать и прислать в чат для подготовки научного отчета.")
@@ -2184,11 +2273,13 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         universal_diameter_params, diameter_coeff_df, diameter_summary = fit_diameter_universal_grain_size_model(
             cleaned_diameter_results, variant="quadratic_full"
         )
-        diameter_eval = evaluate_diameter_universal_model(universal_diameter_params, cleaned_diameter_results)
+        final_diameter_params = get_final_diameter_params(universal_diameter_params)
+        diameter_eval = evaluate_diameter_universal_model(final_diameter_params, cleaned_diameter_results)
         diameter_payload = {
             "key": "quadratic_full",
             "title": "Диаметр: a(dg), b(dg), c(dg)",
-            "params": universal_diameter_params,
+            "params": final_diameter_params,
+            "params_raw": universal_diameter_params,
             "coeff_df": diameter_coeff_df,
             "summary": diameter_summary,
             "eval": diameter_eval,
@@ -2199,11 +2290,13 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
     try:
         cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
         params_item, coeff_df_item, summary_item = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="median_constants")
-        eval_item = evaluate_sigma_universal_model(params_item, cleaned_sigma_results)
+        final_sigma_params = get_final_sigma_params(params_item)
+        eval_item = evaluate_sigma_universal_model(final_sigma_params, cleaned_sigma_results)
         selected_sigma_variant = {
             "key": "median_constants",
             "title": "Sigma: p,m = медианы",
-            "params": params_item,
+            "params": final_sigma_params,
+            "params_raw": params_item,
             "coeff_df": coeff_df_item,
             "summary": summary_item,
             "eval": eval_item,
