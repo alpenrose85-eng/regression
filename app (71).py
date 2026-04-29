@@ -1663,6 +1663,8 @@ def build_report_export_text(
     sigma_universal_df: pd.DataFrame,
     diameter_grain_df: pd.DataFrame,
     diameter_universal_df: pd.DataFrame,
+    sigma_rounding_df: pd.DataFrame,
+    diameter_rounding_df: pd.DataFrame,
 ) -> str:
     sections = [
         "[ОБЩАЯ СВОДКА ПО ВЫБОРКЕ]",
@@ -1682,8 +1684,92 @@ def build_report_export_text(
         "",
         "[УНИВЕРСАЛЬНАЯ МОДЕЛЬ РОСТА ДИАМЕТРА]",
         dataframe_to_tsv_text(diameter_universal_df),
+        "",
+        "[АНАЛИЗ ОКРУГЛЕНИЯ КОЭФФИЦИЕНТОВ SIGMA-МОДЕЛИ]",
+        dataframe_to_tsv_text(sigma_rounding_df),
+        "",
+        "[АНАЛИЗ ОКРУГЛЕНИЯ КОЭФФИЦИЕНТОВ МОДЕЛИ РОСТА ДИАМЕТРА]",
+        dataframe_to_tsv_text(diameter_rounding_df),
     ]
     return "\n".join(sections)
+
+
+def rounded_copy(params: dict[str, float], decimals: int, keys: list[str]) -> dict[str, float]:
+    rounded = dict(params)
+    for key in keys:
+        if key in rounded and is_finite_number(rounded[key]):
+            rounded[key] = round(float(rounded[key]), decimals)
+    return rounded
+
+
+def build_sigma_rounding_analysis(params: dict[str, float], cleaned_sigma_results: dict[float, FitResult]) -> pd.DataFrame:
+    base_eval = evaluate_sigma_universal_model(params, cleaned_sigma_results)
+    rows: list[dict[str, float]] = [
+        {
+            "Знаков после запятой": 10,
+            "R² по T": float(base_eval["R² по T"]),
+            "RMSE по T, °C": float(base_eval["RMSE по T, °C"]),
+            "MAE по T, °C": float(base_eval["MAE по T, °C"]),
+            "MAPE по T, %": float(base_eval["MAPE по T, %"]),
+            "ΔR²": 0.0,
+            "ΔRMSE, °C": 0.0,
+            "ΔMAE, °C": 0.0,
+            "ΔMAPE, %": 0.0,
+        }
+    ]
+    sigma_keys = ["alpha0", "alpha1", "alpha2", "p_const", "m_const"]
+    for decimals in [8, 7, 6, 5, 4, 3, 2, 1]:
+        rounded_params = rounded_copy(params, decimals, sigma_keys)
+        eval_item = evaluate_sigma_universal_model(rounded_params, cleaned_sigma_results)
+        rows.append(
+            {
+                "Знаков после запятой": decimals,
+                "R² по T": float(eval_item["R² по T"]),
+                "RMSE по T, °C": float(eval_item["RMSE по T, °C"]),
+                "MAE по T, °C": float(eval_item["MAE по T, °C"]),
+                "MAPE по T, %": float(eval_item["MAPE по T, %"]),
+                "ΔR²": float(eval_item["R² по T"] - base_eval["R² по T"]),
+                "ΔRMSE, °C": float(eval_item["RMSE по T, °C"] - base_eval["RMSE по T, °C"]),
+                "ΔMAE, °C": float(eval_item["MAE по T, °C"] - base_eval["MAE по T, °C"]),
+                "ΔMAPE, %": float(eval_item["MAPE по T, %"] - base_eval["MAPE по T, %"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_diameter_rounding_analysis(params: dict[str, float], cleaned_diameter_results: dict[float, FitResult]) -> pd.DataFrame:
+    base_eval = evaluate_diameter_universal_model(params, cleaned_diameter_results)
+    rows: list[dict[str, float]] = [
+        {
+            "Знаков после запятой": 10,
+            "R² по T": float(base_eval["R² по T"]),
+            "RMSE по T, °C": float(base_eval["RMSE по T, °C"]),
+            "MAE по T, °C": float(base_eval["MAE по T, °C"]),
+            "MAPE по T, %": float(base_eval["MAPE по T, %"]),
+            "ΔR²": 0.0,
+            "ΔRMSE, °C": 0.0,
+            "ΔMAE, °C": 0.0,
+            "ΔMAPE, %": 0.0,
+        }
+    ]
+    diameter_keys = ["alpha0", "alpha1", "alpha2", "beta0", "beta1", "beta2", "gamma0", "gamma1", "gamma2"]
+    for decimals in [8, 7, 6, 5, 4, 3, 2, 1]:
+        rounded_params = rounded_copy(params, decimals, diameter_keys)
+        eval_item = evaluate_diameter_universal_model(rounded_params, cleaned_diameter_results)
+        rows.append(
+            {
+                "Знаков после запятой": decimals,
+                "R² по T": float(eval_item["R² по T"]),
+                "RMSE по T, °C": float(eval_item["RMSE по T, °C"]),
+                "MAE по T, °C": float(eval_item["MAE по T, °C"]),
+                "MAPE по T, %": float(eval_item["MAPE по T, %"]),
+                "ΔR²": float(eval_item["R² по T"] - base_eval["R² по T"]),
+                "ΔRMSE, °C": float(eval_item["RMSE по T, °C"] - base_eval["RMSE по T, °C"]),
+                "ΔMAE, °C": float(eval_item["MAE по T, °C"] - base_eval["MAE по T, °C"]),
+                "ΔMAPE, %": float(eval_item["MAPE по T, %"] - base_eval["MAPE по T, %"]),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float]) -> None:
@@ -1751,6 +1837,9 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
         ]
     )
 
+    sigma_rounding_df = build_sigma_rounding_analysis(sigma_params, cleaned_sigma_results)
+    diameter_rounding_df = build_diameter_rounding_analysis(diameter_params, cleaned_diameter_results)
+
     st.markdown("**1. Общая сводка по выборке**")
     st.dataframe(dataset_summary_df, use_container_width=True, hide_index=True)
 
@@ -1769,6 +1858,14 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
     st.markdown("**6. Универсальная модель роста диаметра**")
     st.dataframe(diameter_universal_df, use_container_width=True, hide_index=True)
 
+    st.markdown("**7. Анализ округления коэффициентов универсальной sigma-модели**")
+    st.caption("Сравнение качества модели при последовательном сокращении числа знаков после запятой у итоговых коэффициентов.")
+    st.dataframe(sigma_rounding_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**8. Анализ округления коэффициентов универсальной модели роста диаметра**")
+    st.caption("Таблица помогает выбрать минимальную длину записи коэффициентов без заметной потери точности.")
+    st.dataframe(diameter_rounding_df, use_container_width=True, hide_index=True)
+
     export_text = build_report_export_text(
         dataset_summary_df,
         dataset_by_grain_df,
@@ -1776,6 +1873,8 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
         sigma_universal_df,
         diameter_grain_df,
         diameter_universal_df,
+        sigma_rounding_df,
+        diameter_rounding_df,
     )
     with st.expander("Текстовый экспорт для ассистента"):
         st.caption("Этот блок можно целиком скопировать и прислать в чат для подготовки научного отчета.")
