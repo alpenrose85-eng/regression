@@ -1228,7 +1228,10 @@ def get_recommended_diameter_exclusions(prepared_df: pd.DataFrame, valid_grains:
     return recommendations
 
 
-def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResult]) -> tuple[dict[str, float], pd.DataFrame, str]:
+def fit_diameter_universal_grain_size_model(
+    cleaned_results: dict[float, FitResult],
+    variant: str = "quadratic_full",
+) -> tuple[dict[str, float], pd.DataFrame, str]:
     rows: list[dict[str, float]] = []
     for grain, result in cleaned_results.items():
         grain_size = GRAIN_SIZE_MM.get(float(grain))
@@ -1253,32 +1256,55 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
     ln_g = coeff_df["ln_grain_size"].to_numpy(dtype=float)
     X = np.column_stack([np.ones(len(coeff_df)), ln_g, ln_g ** 2])
     model_a = sm.OLS(coeff_df["a"], X).fit()
-    model_b = sm.OLS(coeff_df["b"], X).fit()
     model_c = sm.OLS(coeff_df["c"], X).fit()
-
     params_a = np.asarray(model_a.params, dtype=float)
-    params_b = np.asarray(model_b.params, dtype=float)
     params_c = np.asarray(model_c.params, dtype=float)
+
+    if variant == "quadratic_full":
+        model_b = sm.OLS(coeff_df["b"], X).fit()
+        params_b = np.asarray(model_b.params, dtype=float)
+        b_const = None
+        variant_label = "a(dg), b(dg), c(dg) = u0 + u1·ln(dg) + u2·[ln(dg)]²"
+        variant_title = "Диаметр: a(dg), b(dg), c(dg)"
+        r2_b = float(model_b.rsquared)
+    elif variant == "median_b":
+        model_b = None
+        params_b = np.array([np.nan, np.nan, np.nan], dtype=float)
+        b_const = float(coeff_df["b"].median())
+        variant_label = "a(dg), c(dg) = u0 + u1·ln(dg) + u2·[ln(dg)]²; b = median"
+        variant_title = "Диаметр: a(dg), c(dg), b=median"
+        r2_b = np.nan
+    else:
+        raise ValueError(f"Неизвестный вариант универсальной модели диаметра: {variant}")
 
     params = {
         "alpha0": float(params_a[0]),
         "alpha1": float(params_a[1]),
         "alpha2": float(params_a[2]),
-        "beta0": float(params_b[0]),
-        "beta1": float(params_b[1]),
-        "beta2": float(params_b[2]),
+        "beta0": float(params_b[0]) if np.isfinite(params_b[0]) else np.nan,
+        "beta1": float(params_b[1]) if np.isfinite(params_b[1]) else np.nan,
+        "beta2": float(params_b[2]) if np.isfinite(params_b[2]) else np.nan,
+        "b_const": b_const,
         "gamma0": float(params_c[0]),
         "gamma1": float(params_c[1]),
         "gamma2": float(params_c[2]),
         "r2_a": float(model_a.rsquared),
-        "r2_b": float(model_b.rsquared),
+        "r2_b": r2_b,
         "r2_c": float(model_c.rsquared),
+        "variant": variant,
+        "variant_label": variant_label,
+        "variant_title": variant_title,
     }
     included_grains = ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in coeff_df["G"].tolist())
+    b_line = (
+        f"b(dg)=beta0+beta1·ln(dg)+beta2·[ln(dg)]², R²={model_b.rsquared:.4f}"
+        if model_b is not None
+        else f"b={b_const:.10f} (медиана по очищенным зерновым моделям)"
+    )
     summary_text = (
         "Метамодель коэффициентов очищенных зерновых моделей по размеру зерна.\n\n"
         f"a(dg)=alpha0+alpha1·ln(dg)+alpha2·[ln(dg)]², R²={model_a.rsquared:.4f}\n"
-        f"b(dg)=beta0+beta1·ln(dg)+beta2·[ln(dg)]², R²={model_b.rsquared:.4f}\n"
+        f"{b_line}\n"
         f"c(dg)=gamma0+gamma1·ln(dg)+gamma2·[ln(dg)]², R²={model_c.rsquared:.4f}\n"
         f"Использованы все зерна: {included_grains}"
     )
@@ -1425,7 +1451,10 @@ def build_sigma_coefficient_df(
 def predict_temperature_diameter_universal(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
     ln_g = np.log(grain_size_mm)
     a_val = params["alpha0"] + params["alpha1"] * ln_g + params["alpha2"] * (ln_g ** 2)
-    b_val = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
+    if np.isfinite(params.get("b_const", np.nan)):
+        b_val = params["b_const"]
+    else:
+        b_val = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
     c_val = params["gamma0"] + params["gamma1"] * ln_g + params["gamma2"] * (ln_g ** 2)
     if not np.isfinite(c_val) or abs(c_val) < 1e-12:
         raise ValueError("Универсальная модель дала слишком малый коэффициент при 1/T.")
@@ -1522,6 +1551,26 @@ def parse_optional_float(value: str) -> float | None:
     return float(text)
 
 
+def format_temperature_interpretation(temp_value: float, min_valid_temp: float = 550.0) -> str:
+    if not np.isfinite(temp_value):
+        return "—"
+    if temp_value < min_valid_temp:
+        return f"< {min_valid_temp:.0f} °C (вне физически обоснованной области)"
+    return f"{temp_value:.4f}"
+
+
+def add_temperature_interpretation_column(
+    df: pd.DataFrame,
+    source_col: str = "T_pred",
+    target_col: str = "Интерпретация T_pred, °C",
+    min_valid_temp: float = 550.0,
+) -> pd.DataFrame:
+    view = df.copy()
+    if source_col in view.columns:
+        view[target_col] = view[source_col].apply(lambda x: format_temperature_interpretation(float(x), min_valid_temp))
+    return view
+
+
 def clear_sigma_when_diameter_entered() -> None:
     if str(st.session_state.get("universal_choice_d", "")).strip():
         st.session_state["universal_choice_sigma"] = ""
@@ -1566,7 +1615,9 @@ def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
     if submitted:
         try:
             temp_value = predict_temperature_diameter_growth(calc_params, d_value, tau_value)
-            st.metric("Расчетная температура по модели диаметра, °C", f"{temp_value:.4f}")
+            st.metric("Расчетная температура по модели диаметра, °C", format_temperature_interpretation(temp_value))
+            if temp_value < 550.0:
+                st.caption("Значение ниже 550 °C показывается как вне физически обоснованной области, но сама формула модели не меняется.")
         except Exception as exc:
             st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
 
@@ -1577,6 +1628,7 @@ def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
         fit_function=fit_diameter_growth_model,
         preselect_outliers=True,
         auto_apply_selected=False,
+        min_interpretable_temp=550.0,
     )
 
 
@@ -1721,25 +1773,30 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
 
     diameter_error_local = None
     sigma_error_local = None
+    diameter_variants: list[dict[str, object]] = []
     diameter_payload = None
     selected_sigma_variant = None
 
     try:
         cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
-        universal_diameter_params, diameter_coeff_df, diameter_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
-        diameter_eval = evaluate_diameter_universal_model(universal_diameter_params, cleaned_diameter_results)
-        diameter_analysis_a = analyze_coefficient_forms(diameter_coeff_df, "a")
-        diameter_analysis_b = analyze_coefficient_forms(diameter_coeff_df, "b")
-        diameter_analysis_c = analyze_coefficient_forms(diameter_coeff_df, "c")
-        diameter_payload = {
-            "params": universal_diameter_params,
-            "coeff_df": diameter_coeff_df,
-            "summary": diameter_summary,
-            "eval": diameter_eval,
-            "analysis_a": diameter_analysis_a,
-            "analysis_b": diameter_analysis_b,
-            "analysis_c": diameter_analysis_c,
-        }
+        for variant_key, variant_title in [
+            ("quadratic_full", "Диаметр: a(dg), b(dg), c(dg)"),
+            ("median_b", "Диаметр: a(dg), c(dg), b=median"),
+        ]:
+            universal_diameter_params, diameter_coeff_df, diameter_summary = fit_diameter_universal_grain_size_model(
+                cleaned_diameter_results, variant=variant_key
+            )
+            diameter_eval = evaluate_diameter_universal_model(universal_diameter_params, cleaned_diameter_results)
+            diameter_variant = {
+                "key": variant_key,
+                "title": variant_title,
+                "params": universal_diameter_params,
+                "coeff_df": diameter_coeff_df,
+                "summary": diameter_summary,
+                "eval": diameter_eval,
+            }
+            diameter_variants.append(diameter_variant)
+        diameter_payload = diameter_variants[0] if diameter_variants else None
     except Exception as exc:
         diameter_error_local = str(exc)
 
@@ -1759,16 +1816,16 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         sigma_error_local = str(exc)
 
     quality_rows = []
-    if diameter_payload is not None:
+    for diameter_variant in diameter_variants:
         quality_rows.append(
             {
                 "Модель": "Универсальная модель диаметра",
-                "Версия": "a(dg), b(dg), c(dg)",
-                "R² по T": diameter_payload["eval"]["R² по T"],
-                "RMSE по T, °C": diameter_payload["eval"]["RMSE по T, °C"],
-                "MAE по T, °C": diameter_payload["eval"]["MAE по T, °C"],
-                "MAPE по T, %": diameter_payload["eval"]["MAPE по T, %"],
-                "Количество точек": diameter_payload["eval"]["Количество точек"],
+                "Версия": diameter_variant["title"],
+                "R² по T": diameter_variant["eval"]["R² по T"],
+                "RMSE по T, °C": diameter_variant["eval"]["RMSE по T, °C"],
+                "MAE по T, °C": diameter_variant["eval"]["MAE по T, °C"],
+                "MAPE по T, %": diameter_variant["eval"]["MAPE по T, %"],
+                "Количество точек": diameter_variant["eval"]["Количество точек"],
             }
         )
     if selected_sigma_variant is not None:
@@ -1790,16 +1847,24 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
     col_left, col_right = st.columns(2)
     with col_left:
         st.subheader("Формула универсальной модели диаметра")
-        if diameter_payload is None:
+        if not diameter_variants:
             st.error(f"Модель диаметра недоступна: {diameter_error_local}")
         else:
+            diameter_variant_titles = [str(item["title"]) for item in diameter_variants]
+            diameter_variant_choice = st.selectbox("Вариант универсальной модели диаметра", diameter_variant_titles, key="universal_diameter_variant_choice")
+            diameter_payload = next(item for item in diameter_variants if item["title"] == diameter_variant_choice)
             p = diameter_payload["params"]
+            b_line = (
+                f"b(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg) + ({p['beta2']:.8f}) · [ln(dg)]²"
+                if not np.isfinite(p.get("b_const", np.nan))
+                else f"b = {p['b_const']:.10f}"
+            )
             st.code(
                 "\n".join(
                     [
                         "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))",
                         f"a(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg) + ({p['alpha2']:.8f}) · [ln(dg)]²",
-                        f"b(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg) + ({p['beta2']:.8f}) · [ln(dg)]²",
+                        b_line,
                         f"c(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg) + ({p['gamma2']:.8f}) · [ln(dg)]²",
                     ]
                 ),
@@ -1807,14 +1872,6 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
             )
             with st.expander("Сводка по универсальной модели диаметра"):
                 st.text(diameter_payload["summary"])
-            with st.expander("Сравнение 4 форм для коэффициентов a, b, c"):
-                tab_a, tab_b, tab_c = st.tabs(["Коэффициент a", "Коэффициент b", "Коэффициент c"])
-                with tab_a:
-                    st.dataframe(diameter_payload["analysis_a"], use_container_width=True, hide_index=True)
-                with tab_b:
-                    st.dataframe(diameter_payload["analysis_b"], use_container_width=True, hide_index=True)
-                with tab_c:
-                    st.dataframe(diameter_payload["analysis_c"], use_container_width=True, hide_index=True)
 
     with col_right:
         st.subheader("Формула универсальной sigma-модели")
@@ -1868,22 +1925,34 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 if diameter_payload is None:
                     raise ValueError(diameter_error_local or "Универсальная модель диаметра недоступна.")
                 temp_d = predict_temperature_diameter_universal(diameter_payload["params"], round(diameter_value, 2), tau_value, grain_size)
-                result_rows.append({"Модель": "Универсальная модель диаметра", "Расчетная температура, °C": temp_d})
+                result_rows.append(
+                    {
+                        "Модель": "Универсальная модель диаметра",
+                        "Расчетная температура, °C": temp_d,
+                        "Интерпретация": format_temperature_interpretation(temp_d),
+                    }
+                )
             if sigma_value is not None:
                 if selected_sigma_variant is None:
                     raise ValueError(sigma_error_local or "Универсальная sigma-модель недоступна.")
                 temp_sigma = predict_temperature_sigma_universal(selected_sigma_variant["params"], tau_value, round(sigma_value, 2), grain_size)
-                result_rows.append({"Модель": "Универсальная sigma-модель", "Расчетная температура, °C": temp_sigma})
+                result_rows.append(
+                    {
+                        "Модель": "Универсальная sigma-модель",
+                        "Расчетная температура, °C": temp_sigma,
+                        "Интерпретация": f"{temp_sigma:.4f}",
+                    }
+                )
 
             if len(result_rows) == 1:
                 row = result_rows[0]
-                st.success(f"{row['Модель']}: {row['Расчетная температура, °C']:.4f} °C")
+                st.success(f"{row['Модель']}: {row['Интерпретация']}")
             else:
                 c_res1, c_res2 = st.columns(2)
                 with c_res1:
-                    st.metric("Температура по универсальной модели диаметра, °C", f"{result_rows[0]['Расчетная температура, °C']:.4f}")
+                    st.metric("Температура по универсальной модели диаметра, °C", result_rows[0]["Интерпретация"])
                 with c_res2:
-                    st.metric("Температура по универсальной sigma-модели, °C", f"{result_rows[1]['Расчетная температура, °C']:.4f}")
+                    st.metric("Температура по универсальной sigma-модели, °C", result_rows[1]["Интерпретация"])
             st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
         except Exception as exc:
             st.error(f"Не удалось выполнить расчет: {exc}")
@@ -1896,6 +1965,7 @@ def show_result_block(
     fit_function=fit_engineering_model,
     preselect_outliers: bool = True,
     auto_apply_selected: bool = True,
+    min_interpretable_temp: float | None = None,
 ) -> None:
     st.subheader("Показатели качества модели")
     metric_cards(result.metrics)
@@ -1918,7 +1988,9 @@ def show_result_block(
             "cooks_distance",
             "G",
         ]
-    ].head(15)
+    ].head(15).copy()
+    if min_interpretable_temp is not None:
+        weak_view = add_temperature_interpretation_column(weak_view, "T_pred", min_valid_temp=min_interpretable_temp)
     st.dataframe(weak_view, use_container_width=True, hide_index=True)
 
     if not result.outlier_recommendation.empty:
@@ -1973,7 +2045,10 @@ def show_result_block(
         "G",
         "c_sigma",
     ]
-    st.dataframe(result.data[view_columns], use_container_width=True, hide_index=True)
+    result_view = result.data[view_columns].copy()
+    if min_interpretable_temp is not None:
+        result_view = add_temperature_interpretation_column(result_view, "T_pred", min_valid_temp=min_interpretable_temp)
+    st.dataframe(result_view, use_container_width=True, hide_index=True)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2290,29 +2365,70 @@ with diameter_tab:
             cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
             st.subheader("Универсальная модель по размеру зерна")
             try:
-                universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
-                coeff_analysis_a = analyze_coefficient_forms(coeff_df, "a")
-                coeff_analysis_b = analyze_coefficient_forms(coeff_df, "b")
-                coeff_analysis_c = analyze_coefficient_forms(coeff_df, "c")
+                diameter_variant_payloads = []
+                for variant_key, variant_title in [
+                    ("quadratic_full", "Вариант 1: a(dg), b(dg), c(dg)"),
+                    ("median_b", "Вариант 2: a(dg), c(dg), b = median"),
+                ]:
+                    universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(
+                        cleaned_diameter_results, variant=variant_key
+                    )
+                    universal_eval = evaluate_diameter_universal_model(universal_params, cleaned_diameter_results)
+                    diameter_variant_payloads.append(
+                        {
+                            "title": variant_title,
+                            "params": universal_params,
+                            "coeff_df": coeff_df,
+                            "summary": universal_summary,
+                            "eval": universal_eval,
+                        }
+                    )
+                selected_diameter_payload = diameter_variant_payloads[0]
+                universal_params = selected_diameter_payload["params"]
+                coeff_df = selected_diameter_payload["coeff_df"]
+                universal_summary = selected_diameter_payload["summary"]
+                meta_quality_df = pd.DataFrame(
+                    [
+                        {
+                            "Вариант": item["title"],
+                            "R² для a(dg)": item["params"]["r2_a"],
+                            "R² для b(dg)": item["params"]["r2_b"],
+                            "R² для c(dg)": item["params"]["r2_c"],
+                            "b": item["params"]["b_const"] if np.isfinite(item["params"].get("b_const", np.nan)) else np.nan,
+                            "R² по T": item["eval"]["R² по T"],
+                            "RMSE по T, °C": item["eval"]["RMSE по T, °C"],
+                            "Количество точек": item["eval"]["Количество точек"],
+                        }
+                        for item in diameter_variant_payloads
+                    ]
+                )
+                st.dataframe(meta_quality_df, use_container_width=True, hide_index=True)
+                diameter_variant_titles = [item["title"] for item in diameter_variant_payloads]
+                diameter_variant_choice = st.selectbox(
+                    "Показать формулу и использовать в калькуляторе",
+                    diameter_variant_titles,
+                    key="diameter_universal_variant_section_choice",
+                )
+                selected_diameter_payload = next(item for item in diameter_variant_payloads if item["title"] == diameter_variant_choice)
+                universal_params = selected_diameter_payload["params"]
+                coeff_df = selected_diameter_payload["coeff_df"]
+                universal_summary = selected_diameter_payload["summary"]
+                b_line = (
+                    "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²\n"
+                    f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}, beta2 = {universal_params['beta2']:.8f}"
+                    if not np.isfinite(universal_params.get("b_const", np.nan))
+                    else f"b = {universal_params['b_const']:.10f}"
+                )
                 formula_text = (
                     "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))\n"
                     "a(dg) = alpha0 + alpha1·ln(dg) + alpha2·[ln(dg)]²\n"
-                    "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²\n"
                     "c(dg) = gamma0 + gamma1·ln(dg) + gamma2·[ln(dg)]²\n"
                     f"alpha0 = {universal_params['alpha0']:.8f}, alpha1 = {universal_params['alpha1']:.8f}, alpha2 = {universal_params['alpha2']:.8f}\n"
-                    f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}, beta2 = {universal_params['beta2']:.8f}\n"
+                    f"{b_line}\n"
                     f"gamma0 = {universal_params['gamma0']:.8f}, gamma1 = {universal_params['gamma1']:.8f}, gamma2 = {universal_params['gamma2']:.8f}"
                 )
                 st.code(formula_text, language="text")
                 st.dataframe(coeff_df, use_container_width=True, hide_index=True)
-                st.subheader("Сравнение 4 форм зависимости коэффициентов от размера зерна")
-                tab_a, tab_b, tab_c = st.tabs(["Коэффициент a", "Коэффициент b", "Коэффициент c"])
-                with tab_a:
-                    st.dataframe(coeff_analysis_a, use_container_width=True, hide_index=True)
-                with tab_b:
-                    st.dataframe(coeff_analysis_b, use_container_width=True, hide_index=True)
-                with tab_c:
-                    st.dataframe(coeff_analysis_c, use_container_width=True, hide_index=True)
                 with st.expander("Сводка по универсальной модели"):
                     st.text(universal_summary)
 
@@ -2329,7 +2445,9 @@ with diameter_tab:
                 if submitted:
                     try:
                         temp_value = predict_temperature_diameter_universal(universal_params, d_value, tau_value, GRAIN_SIZE_MM[float(grain_number)])
-                        st.metric("Расчетная температура по универсальной модели, °C", f"{temp_value:.4f}")
+                        st.metric("Расчетная температура по универсальной модели, °C", format_temperature_interpretation(temp_value))
+                        if temp_value < 550.0:
+                            st.caption("Если расчет ниже 550 °C, результат показывается как вне физически обоснованной области без изменения самой формулы модели.")
                     except Exception as exc:
                         st.error(f"Не удалось выполнить расчет по универсальной модели: {exc}")
             except Exception as exc:
