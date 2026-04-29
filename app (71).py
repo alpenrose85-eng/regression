@@ -212,6 +212,8 @@ def prepare_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     prepared["T_kelvin"] = prepared["T"] + 273.15
     prepared["inv_T"] = 1.0 / prepared["T_kelvin"]
+    prepared["T_above_550"] = prepared["T"] - 550.0
+    prepared["inv_T_above_550"] = np.where(prepared["T_above_550"] > 0, 1.0 / prepared["T_above_550"], np.nan)
     prepared["ln_D"] = np.log(prepared["D"])
     prepared["ln_tau"] = np.log(prepared["tau"])
     prepared["ln_c_sigma"] = np.log(prepared["c_sigma"])
@@ -562,28 +564,30 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
             weak_points=weak_points,
             model_summary="Модели роста диаметра по отдельным зернам.\n\n" + "\n\n".join(summary_parts),
             outlier_recommendation=outlier_recommendation,
-            formula_text="Для каждого номера зерна отдельно: ln(D)=a_G+b_G·ln(τ)+c_G·(1/T(K))",
-            model_label="Эмпирические модели роста диаметра по отдельным зернам",
+            formula_text="Для каждого номера зерна отдельно: ln(D)=a_G+b_G·ln(τ)+c_G·(1/(T-550))",
+            model_label="Эмпирические модели роста диаметра по отдельным зернам с порогом 550 °C",
         )
 
-    feature_columns = ["ln_tau", "inv_T"]
+    if (df["T"] <= 550.0).any():
+        raise ValueError("Для физически ограниченной модели диаметра все температуры должны быть строго выше 550 °C.")
+
+    feature_columns = ["ln_tau", "inv_T_above_550"]
     X = sm.add_constant(df[feature_columns])
     y = df["ln_D"]
 
     model = sm.OLS(y, X).fit()
     influence = model.get_influence()
 
-    a2 = model.params.get("inv_T", np.nan)
+    a2 = model.params.get("inv_T_above_550", np.nan)
     if not np.isfinite(a2) or abs(a2) < 1e-12:
-        raise ValueError("Коэффициент при 1/T в модели роста диаметра слишком мал для устойчивого обратного расчета.")
+        raise ValueError("Коэффициент при 1/(T-550) в модели роста диаметра слишком мал для устойчивого обратного расчета.")
 
     numerator = df["ln_D"] - model.params.get("const", 0.0) - model.params.get("ln_tau", 0.0) * df["ln_tau"]
     inv_t_pred = numerator / a2
     if np.any(inv_t_pred <= 0):
-        raise ValueError("Модель роста диаметра дала неположительное значение 1/T для части точек.")
+        raise ValueError("Модель роста диаметра дала неположительное значение 1/(T-550) для части точек.")
 
-    temp_kelvin_pred = 1.0 / inv_t_pred
-    temp_c_pred = temp_kelvin_pred - 273.15
+    temp_c_pred = 550.0 + 1.0 / inv_t_pred
 
     result_df = df.copy()
     result_df["inv_T_pred"] = inv_t_pred
@@ -608,23 +612,23 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
     params = pd.DataFrame(
         {
             "Коэффициент": ["a", "b", "c"],
-            "Параметр модели": ["const", "ln_tau", "inv_T"],
-            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get("inv_T", np.nan)],
-            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get("inv_T", np.nan)],
-            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get("inv_T", np.nan)],
-            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get("inv_T", np.nan)],
-            "Нижняя 95% граница": [conf_int.loc["const", 0], conf_int.loc["ln_tau", 0], conf_int.loc["inv_T", 0]],
-            "Верхняя 95% граница": [conf_int.loc["const", 1], conf_int.loc["ln_tau", 1], conf_int.loc["inv_T", 1]],
+            "Параметр модели": ["const", "ln_tau", "inv_T_above_550"],
+            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get("inv_T_above_550", np.nan)],
+            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get("inv_T_above_550", np.nan)],
+            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get("inv_T_above_550", np.nan)],
+            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get("inv_T_above_550", np.nan)],
+            "Нижняя 95% граница": [conf_int.loc["const", 0], conf_int.loc["ln_tau", 0], conf_int.loc["inv_T_above_550", 0]],
+            "Верхняя 95% граница": [conf_int.loc["const", 1], conf_int.loc["ln_tau", 1], conf_int.loc["inv_T_above_550", 1]],
         }
     )
 
     metrics = build_metrics(result_df, predictor_count=len(feature_columns))
     formula_text = (
-        "ln(D) = a + b·ln(τ) + c·(1/T(K))\n"
+        "ln(D) = a + b·ln(τ) + c·(1/(T - 550))\n"
         f"a = {model.params.get('const', np.nan):.8f}\n"
         f"b = {model.params.get('ln_tau', np.nan):.8f}\n"
-        f"c = {model.params.get('inv_T', np.nan):.8f}\n"
-        f"Итог: ln(D) = {model.params.get('const', np.nan):.8f} + ({model.params.get('ln_tau', np.nan):.8f})·ln(τ) + ({model.params.get('inv_T', np.nan):.8f})·(1/T(K))"
+        f"c = {model.params.get('inv_T_above_550', np.nan):.8f}\n"
+        f"Итог: ln(D) = {model.params.get('const', np.nan):.8f} + ({model.params.get('ln_tau', np.nan):.8f})·ln(τ) + ({model.params.get('inv_T_above_550', np.nan):.8f})·(1/(T - 550))"
     )
 
     return FitResult(
@@ -635,7 +639,7 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
         model_summary=model.summary().as_text(),
         outlier_recommendation=outlier_recommendation,
         formula_text=formula_text,
-        model_label="Эмпирическая модель роста диаметра ln(D)=a+b·ln(τ)+c·(1/T)",
+        model_label="Эмпирическая модель роста диаметра ln(D)=a+b·ln(τ)+c·(1/(T-550))",
     )
 
 
@@ -1146,13 +1150,13 @@ def predict_temperature_improved(params: dict[str, float], D: float, tau: float,
 
 
 def predict_temperature_diameter_growth(params: dict[str, float], D: float, tau: float) -> float:
-    a2 = params.get("inv_T", np.nan)
+    a2 = params.get("inv_T_above_550", np.nan)
     if not np.isfinite(a2) or abs(a2) < 1e-12:
-        raise ValueError("В модели роста диаметра коэффициент при 1/T слишком мал для устойчивого расчета.")
+        raise ValueError("В модели роста диаметра коэффициент при 1/(T-550) слишком мал для устойчивого расчета.")
     inv_t = (np.log(D) - params.get("const", 0.0) - params.get("ln_tau", 0.0) * np.log(tau)) / a2
     if inv_t <= 0:
-        raise ValueError("Модель роста диаметра дала неположительное значение 1/T.")
-    return 1.0 / inv_t - 273.15
+        raise ValueError("Модель роста диаметра дала неположительное значение 1/(T-550).")
+    return 550.0 + 1.0 / inv_t
 
 
 def build_cleaned_diameter_grain_results(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, FitResult]:
@@ -1228,7 +1232,10 @@ def get_recommended_diameter_exclusions(prepared_df: pd.DataFrame, valid_grains:
     return recommendations
 
 
-def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResult]) -> tuple[dict[str, float], pd.DataFrame, str]:
+def fit_diameter_universal_grain_size_model(
+    cleaned_results: dict[float, FitResult],
+    variant: str = "quadratic_full",
+) -> tuple[dict[str, float], pd.DataFrame, str]:
     rows: list[dict[str, float]] = []
     for grain, result in cleaned_results.items():
         grain_size = GRAIN_SIZE_MM.get(float(grain))
@@ -1242,7 +1249,7 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
                 "ln_grain_size": float(np.log(grain_size)),
                 "a": float(params.get("const", np.nan)),
                 "b": float(params.get("ln_tau", np.nan)),
-                "c": float(params.get("inv_T", np.nan)),
+                "c": float(params.get("inv_T_above_550", np.nan)),
                 "R²": float(result.metrics.get("R²", np.nan)),
             }
         )
@@ -1253,32 +1260,55 @@ def fit_diameter_universal_grain_size_model(cleaned_results: dict[float, FitResu
     ln_g = coeff_df["ln_grain_size"].to_numpy(dtype=float)
     X = np.column_stack([np.ones(len(coeff_df)), ln_g, ln_g ** 2])
     model_a = sm.OLS(coeff_df["a"], X).fit()
-    model_b = sm.OLS(coeff_df["b"], X).fit()
     model_c = sm.OLS(coeff_df["c"], X).fit()
-
     params_a = np.asarray(model_a.params, dtype=float)
-    params_b = np.asarray(model_b.params, dtype=float)
     params_c = np.asarray(model_c.params, dtype=float)
+
+    if variant == "quadratic_full":
+        model_b = sm.OLS(coeff_df["b"], X).fit()
+        params_b = np.asarray(model_b.params, dtype=float)
+        b_const = None
+        variant_label = "a(dg), b(dg), c(dg) = u0 + u1·ln(dg) + u2·[ln(dg)]²"
+        variant_title = "Диаметр: a(dg), b(dg), c(dg)"
+        r2_b = float(model_b.rsquared)
+    elif variant == "median_b":
+        model_b = None
+        params_b = np.array([np.nan, np.nan, np.nan], dtype=float)
+        b_const = float(coeff_df["b"].median())
+        variant_label = "a(dg), c(dg) = u0 + u1·ln(dg) + u2·[ln(dg)]²; b = median"
+        variant_title = "Диаметр: a(dg), c(dg), b=median"
+        r2_b = np.nan
+    else:
+        raise ValueError(f"Неизвестный вариант универсальной модели диаметра: {variant}")
 
     params = {
         "alpha0": float(params_a[0]),
         "alpha1": float(params_a[1]),
         "alpha2": float(params_a[2]),
-        "beta0": float(params_b[0]),
-        "beta1": float(params_b[1]),
-        "beta2": float(params_b[2]),
+        "beta0": float(params_b[0]) if np.isfinite(params_b[0]) else np.nan,
+        "beta1": float(params_b[1]) if np.isfinite(params_b[1]) else np.nan,
+        "beta2": float(params_b[2]) if np.isfinite(params_b[2]) else np.nan,
+        "b_const": b_const,
         "gamma0": float(params_c[0]),
         "gamma1": float(params_c[1]),
         "gamma2": float(params_c[2]),
         "r2_a": float(model_a.rsquared),
-        "r2_b": float(model_b.rsquared),
+        "r2_b": r2_b,
         "r2_c": float(model_c.rsquared),
+        "variant": variant,
+        "variant_label": variant_label,
+        "variant_title": variant_title,
     }
     included_grains = ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in coeff_df["G"].tolist())
+    b_line = (
+        f"b(dg)=beta0+beta1·ln(dg)+beta2·[ln(dg)]², R²={model_b.rsquared:.4f}"
+        if model_b is not None
+        else f"b={b_const:.10f} (медиана по очищенным зерновым моделям)"
+    )
     summary_text = (
         "Метамодель коэффициентов очищенных зерновых моделей по размеру зерна.\n\n"
         f"a(dg)=alpha0+alpha1·ln(dg)+alpha2·[ln(dg)]², R²={model_a.rsquared:.4f}\n"
-        f"b(dg)=beta0+beta1·ln(dg)+beta2·[ln(dg)]², R²={model_b.rsquared:.4f}\n"
+        f"{b_line}\n"
         f"c(dg)=gamma0+gamma1·ln(dg)+gamma2·[ln(dg)]², R²={model_c.rsquared:.4f}\n"
         f"Использованы все зерна: {included_grains}"
     )
@@ -1425,14 +1455,17 @@ def build_sigma_coefficient_df(
 def predict_temperature_diameter_universal(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
     ln_g = np.log(grain_size_mm)
     a_val = params["alpha0"] + params["alpha1"] * ln_g + params["alpha2"] * (ln_g ** 2)
-    b_val = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
+    if np.isfinite(params.get("b_const", np.nan)):
+        b_val = params["b_const"]
+    else:
+        b_val = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
     c_val = params["gamma0"] + params["gamma1"] * ln_g + params["gamma2"] * (ln_g ** 2)
     if not np.isfinite(c_val) or abs(c_val) < 1e-12:
-        raise ValueError("Универсальная модель дала слишком малый коэффициент при 1/T.")
+        raise ValueError("Универсальная модель дала слишком малый коэффициент при 1/(T-550).")
     inv_t = (np.log(D) - a_val - b_val * np.log(tau)) / c_val
     if not np.isfinite(inv_t) or inv_t <= 0:
-        raise ValueError("Универсальная модель дала неположительное значение 1/T.")
-    return float(1.0 / inv_t - 273.15)
+        raise ValueError("Универсальная модель дала неположительное значение 1/(T-550).")
+    return float(550.0 + 1.0 / inv_t)
 
 
 def predict_temperature_sigma_universal(params: dict[str, float], tau: float, c_sigma: float, grain_size_mm: float) -> float:
@@ -1721,25 +1754,30 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
 
     diameter_error_local = None
     sigma_error_local = None
+    diameter_variants: list[dict[str, object]] = []
     diameter_payload = None
     selected_sigma_variant = None
 
     try:
         cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
-        universal_diameter_params, diameter_coeff_df, diameter_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
-        diameter_eval = evaluate_diameter_universal_model(universal_diameter_params, cleaned_diameter_results)
-        diameter_analysis_a = analyze_coefficient_forms(diameter_coeff_df, "a")
-        diameter_analysis_b = analyze_coefficient_forms(diameter_coeff_df, "b")
-        diameter_analysis_c = analyze_coefficient_forms(diameter_coeff_df, "c")
-        diameter_payload = {
-            "params": universal_diameter_params,
-            "coeff_df": diameter_coeff_df,
-            "summary": diameter_summary,
-            "eval": diameter_eval,
-            "analysis_a": diameter_analysis_a,
-            "analysis_b": diameter_analysis_b,
-            "analysis_c": diameter_analysis_c,
-        }
+        for variant_key, variant_title in [
+            ("quadratic_full", "Диаметр: a(dg), b(dg), c(dg)"),
+            ("median_b", "Диаметр: a(dg), c(dg), b=median"),
+        ]:
+            universal_diameter_params, diameter_coeff_df, diameter_summary = fit_diameter_universal_grain_size_model(
+                cleaned_diameter_results, variant=variant_key
+            )
+            diameter_eval = evaluate_diameter_universal_model(universal_diameter_params, cleaned_diameter_results)
+            diameter_variant = {
+                "key": variant_key,
+                "title": variant_title,
+                "params": universal_diameter_params,
+                "coeff_df": diameter_coeff_df,
+                "summary": diameter_summary,
+                "eval": diameter_eval,
+            }
+            diameter_variants.append(diameter_variant)
+        diameter_payload = diameter_variants[0] if diameter_variants else None
     except Exception as exc:
         diameter_error_local = str(exc)
 
@@ -1759,16 +1797,16 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         sigma_error_local = str(exc)
 
     quality_rows = []
-    if diameter_payload is not None:
+    for diameter_variant in diameter_variants:
         quality_rows.append(
             {
                 "Модель": "Универсальная модель диаметра",
-                "Версия": "a(dg), b(dg), c(dg)",
-                "R² по T": diameter_payload["eval"]["R² по T"],
-                "RMSE по T, °C": diameter_payload["eval"]["RMSE по T, °C"],
-                "MAE по T, °C": diameter_payload["eval"]["MAE по T, °C"],
-                "MAPE по T, %": diameter_payload["eval"]["MAPE по T, %"],
-                "Количество точек": diameter_payload["eval"]["Количество точек"],
+                "Версия": diameter_variant["title"],
+                "R² по T": diameter_variant["eval"]["R² по T"],
+                "RMSE по T, °C": diameter_variant["eval"]["RMSE по T, °C"],
+                "MAE по T, °C": diameter_variant["eval"]["MAE по T, °C"],
+                "MAPE по T, %": diameter_variant["eval"]["MAPE по T, %"],
+                "Количество точек": diameter_variant["eval"]["Количество точек"],
             }
         )
     if selected_sigma_variant is not None:
@@ -1790,16 +1828,24 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
     col_left, col_right = st.columns(2)
     with col_left:
         st.subheader("Формула универсальной модели диаметра")
-        if diameter_payload is None:
+        if not diameter_variants:
             st.error(f"Модель диаметра недоступна: {diameter_error_local}")
         else:
+            diameter_variant_titles = [str(item["title"]) for item in diameter_variants]
+            diameter_variant_choice = st.selectbox("Вариант универсальной модели диаметра", diameter_variant_titles, key="universal_diameter_variant_choice")
+            diameter_payload = next(item for item in diameter_variants if item["title"] == diameter_variant_choice)
             p = diameter_payload["params"]
+            b_line = (
+                f"b(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg) + ({p['beta2']:.8f}) · [ln(dg)]²"
+                if not np.isfinite(p.get("b_const", np.nan))
+                else f"b = {p['b_const']:.10f}"
+            )
             st.code(
                 "\n".join(
                     [
-                        "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))",
+                        "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/(T - 550))",
                         f"a(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg) + ({p['alpha2']:.8f}) · [ln(dg)]²",
-                        f"b(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg) + ({p['beta2']:.8f}) · [ln(dg)]²",
+                        b_line,
                         f"c(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg) + ({p['gamma2']:.8f}) · [ln(dg)]²",
                     ]
                 ),
@@ -1807,14 +1853,6 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
             )
             with st.expander("Сводка по универсальной модели диаметра"):
                 st.text(diameter_payload["summary"])
-            with st.expander("Сравнение 4 форм для коэффициентов a, b, c"):
-                tab_a, tab_b, tab_c = st.tabs(["Коэффициент a", "Коэффициент b", "Коэффициент c"])
-                with tab_a:
-                    st.dataframe(diameter_payload["analysis_a"], use_container_width=True, hide_index=True)
-                with tab_b:
-                    st.dataframe(diameter_payload["analysis_b"], use_container_width=True, hide_index=True)
-                with tab_c:
-                    st.dataframe(diameter_payload["analysis_c"], use_container_width=True, hide_index=True)
 
     with col_right:
         st.subheader("Формула универсальной sigma-модели")
@@ -2222,7 +2260,7 @@ with improved_tab:
 with diameter_tab:
     st.write(
         "Модель роста диаметра тоже строится отдельно для каждого номера зерна. "
-        "Для каждого G используется своя зависимость ln(D) = a + b·ln(τ) + c·(1/T), потому что скорость укрупнения сильно зависит от зерна."
+        "Для каждого G используется своя зависимость ln(D) = a + b·ln(τ) + c·(1/(T - 550)), потому что скорость укрупнения сильно зависит от зерна."
     )
     diameter_grain_scores: list[dict[str, float]] = []
     if not valid_grains:
@@ -2290,29 +2328,70 @@ with diameter_tab:
             cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
             st.subheader("Универсальная модель по размеру зерна")
             try:
-                universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(cleaned_diameter_results)
-                coeff_analysis_a = analyze_coefficient_forms(coeff_df, "a")
-                coeff_analysis_b = analyze_coefficient_forms(coeff_df, "b")
-                coeff_analysis_c = analyze_coefficient_forms(coeff_df, "c")
-                formula_text = (
-                    "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))\n"
-                    "a(dg) = alpha0 + alpha1·ln(dg) + alpha2·[ln(dg)]²\n"
+                diameter_variant_payloads = []
+                for variant_key, variant_title in [
+                    ("quadratic_full", "Вариант 1: a(dg), b(dg), c(dg)"),
+                    ("median_b", "Вариант 2: a(dg), c(dg), b = median"),
+                ]:
+                    universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(
+                        cleaned_diameter_results, variant=variant_key
+                    )
+                    universal_eval = evaluate_diameter_universal_model(universal_params, cleaned_diameter_results)
+                    diameter_variant_payloads.append(
+                        {
+                            "title": variant_title,
+                            "params": universal_params,
+                            "coeff_df": coeff_df,
+                            "summary": universal_summary,
+                            "eval": universal_eval,
+                        }
+                    )
+                selected_diameter_payload = diameter_variant_payloads[0]
+                universal_params = selected_diameter_payload["params"]
+                coeff_df = selected_diameter_payload["coeff_df"]
+                universal_summary = selected_diameter_payload["summary"]
+                meta_quality_df = pd.DataFrame(
+                    [
+                        {
+                            "Вариант": item["title"],
+                            "R² для a(dg)": item["params"]["r2_a"],
+                            "R² для b(dg)": item["params"]["r2_b"],
+                            "R² для c(dg)": item["params"]["r2_c"],
+                            "b": item["params"]["b_const"] if np.isfinite(item["params"].get("b_const", np.nan)) else np.nan,
+                            "R² по T": item["eval"]["R² по T"],
+                            "RMSE по T, °C": item["eval"]["RMSE по T, °C"],
+                            "Количество точек": item["eval"]["Количество точек"],
+                        }
+                        for item in diameter_variant_payloads
+                    ]
+                )
+                st.dataframe(meta_quality_df, use_container_width=True, hide_index=True)
+                diameter_variant_titles = [item["title"] for item in diameter_variant_payloads]
+                diameter_variant_choice = st.selectbox(
+                    "Показать формулу и использовать в калькуляторе",
+                    diameter_variant_titles,
+                    key="diameter_universal_variant_section_choice",
+                )
+                selected_diameter_payload = next(item for item in diameter_variant_payloads if item["title"] == diameter_variant_choice)
+                universal_params = selected_diameter_payload["params"]
+                coeff_df = selected_diameter_payload["coeff_df"]
+                universal_summary = selected_diameter_payload["summary"]
+                b_line = (
                     "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²\n"
+                    f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}, beta2 = {universal_params['beta2']:.8f}"
+                    if not np.isfinite(universal_params.get("b_const", np.nan))
+                    else f"b = {universal_params['b_const']:.10f}"
+                )
+                formula_text = (
+                    "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/(T - 550))\n"
+                    "a(dg) = alpha0 + alpha1·ln(dg) + alpha2·[ln(dg)]²\n"
                     "c(dg) = gamma0 + gamma1·ln(dg) + gamma2·[ln(dg)]²\n"
                     f"alpha0 = {universal_params['alpha0']:.8f}, alpha1 = {universal_params['alpha1']:.8f}, alpha2 = {universal_params['alpha2']:.8f}\n"
-                    f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}, beta2 = {universal_params['beta2']:.8f}\n"
+                    f"{b_line}\n"
                     f"gamma0 = {universal_params['gamma0']:.8f}, gamma1 = {universal_params['gamma1']:.8f}, gamma2 = {universal_params['gamma2']:.8f}"
                 )
                 st.code(formula_text, language="text")
                 st.dataframe(coeff_df, use_container_width=True, hide_index=True)
-                st.subheader("Сравнение 4 форм зависимости коэффициентов от размера зерна")
-                tab_a, tab_b, tab_c = st.tabs(["Коэффициент a", "Коэффициент b", "Коэффициент c"])
-                with tab_a:
-                    st.dataframe(coeff_analysis_a, use_container_width=True, hide_index=True)
-                with tab_b:
-                    st.dataframe(coeff_analysis_b, use_container_width=True, hide_index=True)
-                with tab_c:
-                    st.dataframe(coeff_analysis_c, use_container_width=True, hide_index=True)
                 with st.expander("Сводка по универсальной модели"):
                     st.text(universal_summary)
 
