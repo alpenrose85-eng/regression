@@ -1545,6 +1545,17 @@ def is_finite_number(value: object) -> bool:
         return False
 
 
+def fmt_trimmed(value: object, decimals: int) -> str:
+    if not is_finite_number(value):
+        return "—"
+    text = f"{float(value):.{decimals}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text == "-0":
+        text = "0"
+    return text
+
+
 def add_temperature_interpretation_column(
     df: pd.DataFrame,
     source_col: str = "T_pred",
@@ -1578,7 +1589,7 @@ def format_columns_as_strings(df: pd.DataFrame, columns: list[str], decimals: in
     for col in columns:
         if col in view.columns:
             numeric = pd.to_numeric(view[col], errors="coerce")
-            view[col] = numeric.apply(lambda x: "" if pd.isna(x) else f"{float(x):.{decimals}f}")
+            view[col] = numeric.apply(lambda x: "" if pd.isna(x) else fmt_trimmed(float(x), decimals))
     return view
 
 
@@ -2344,9 +2355,9 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 "\n".join(
                     [
                         "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))",
-                        f"a(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg) + ({p['alpha2']:.8f}) · [ln(dg)]²",
-                        f"b(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg) + ({p['beta2']:.8f}) · [ln(dg)]²",
-                        f"c(dg) = {p['gamma0']:.8f} + ({p['gamma1']:.8f}) · ln(dg) + ({p['gamma2']:.8f}) · [ln(dg)]²",
+                        f"a(dg) = {fmt_trimmed(p['alpha0'], 4)} + ({fmt_trimmed(p['alpha1'], 4)}) · ln(dg) + ({fmt_trimmed(p['alpha2'], 4)}) · [ln(dg)]²",
+                        f"b(dg) = {fmt_trimmed(p['beta0'], 4)} + ({fmt_trimmed(p['beta1'], 4)}) · ln(dg) + ({fmt_trimmed(p['beta2'], 4)}) · [ln(dg)]²",
+                        f"c(dg) = {fmt_trimmed(p['gamma0'], 4)} + ({fmt_trimmed(p['gamma1'], 4)}) · ln(dg) + ({fmt_trimmed(p['gamma2'], 4)}) · [ln(dg)]²",
                     ]
                 ),
                 language="text",
@@ -2364,9 +2375,9 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 "\n".join(
                     [
                         "cσ = A(dg) · τ^p · ((T - 550) / 350)^m",
-                        f"log(A)(dg) = {p['alpha0']:.8f} + ({p['alpha1']:.8f}) · ln(dg) + ({p['alpha2']:.8f}) · [ln(dg)]²",
-                        f"p = {p['p_const']:.10f}",
-                        f"m = {p['m_const']:.10f}",
+                        f"log(A)(dg) = {fmt_trimmed(p['alpha0'], 2)} + ({fmt_trimmed(p['alpha1'], 2)}) · ln(dg) + ({fmt_trimmed(p['alpha2'], 2)}) · [ln(dg)]²",
+                        f"p = {fmt_trimmed(p['p_const'], 2)}",
+                        f"m = {fmt_trimmed(p['m_const'], 2)}",
                     ]
                 ),
                 language="text",
@@ -2869,9 +2880,9 @@ with diameter_tab:
                     "a(dg) = alpha0 + alpha1·ln(dg) + alpha2·[ln(dg)]²\n"
                     "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²\n"
                     "c(dg) = gamma0 + gamma1·ln(dg) + gamma2·[ln(dg)]²\n"
-                    f"alpha0 = {universal_params['alpha0']:.8f}, alpha1 = {universal_params['alpha1']:.8f}, alpha2 = {universal_params['alpha2']:.8f}\n"
-                    f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}, beta2 = {universal_params['beta2']:.8f}\n"
-                    f"gamma0 = {universal_params['gamma0']:.8f}, gamma1 = {universal_params['gamma1']:.8f}, gamma2 = {universal_params['gamma2']:.8f}"
+                    f"alpha0 = {fmt_trimmed(universal_params['alpha0'], 4)}, alpha1 = {fmt_trimmed(universal_params['alpha1'], 4)}, alpha2 = {fmt_trimmed(universal_params['alpha2'], 4)}\n"
+                    f"beta0 = {fmt_trimmed(universal_params['beta0'], 4)}, beta1 = {fmt_trimmed(universal_params['beta1'], 4)}, beta2 = {fmt_trimmed(universal_params['beta2'], 4)}\n"
+                    f"gamma0 = {fmt_trimmed(universal_params['gamma0'], 4)}, gamma1 = {fmt_trimmed(universal_params['gamma1'], 4)}, gamma2 = {fmt_trimmed(universal_params['gamma2'], 4)}"
                 )
                 st.code(formula_text, language="text")
                 st.dataframe(coeff_df, use_container_width=True, hide_index=True)
@@ -3042,9 +3053,9 @@ with anchor_tab:
                 st.code(
                     "\n".join(
                         [
-                            f"log(A)(dg) = {selected_params['alpha0']:.8f} + ({selected_params['alpha1']:.8f}) · ln(dg) + ({selected_params['alpha2']:.8f}) · [ln(dg)]²",
-                            f"p = {selected_params['p_const']:.10f}",
-                            f"m = {selected_params['m_const']:.10f}",
+                            f"log(A)(dg) = {fmt_trimmed(selected_params['alpha0'], 2)} + ({fmt_trimmed(selected_params['alpha1'], 2)}) · ln(dg) + ({fmt_trimmed(selected_params['alpha2'], 2)}) · [ln(dg)]²",
+                            f"p = {fmt_trimmed(selected_params['p_const'], 2)}",
+                            f"m = {fmt_trimmed(selected_params['m_const'], 2)}",
                             "",
                             "cσ = A(dg) · τ^p · ((T - 550) / 350)^m",
                         ]
