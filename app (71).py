@@ -1565,6 +1565,50 @@ def dataframe_to_tsv_text(df: pd.DataFrame) -> str:
     return buffer.getvalue().strip()
 
 
+def round_if_present(df: pd.DataFrame, columns: list[str], decimals: int) -> pd.DataFrame:
+    view = df.copy()
+    for col in columns:
+        if col in view.columns:
+            view[col] = pd.to_numeric(view[col], errors="coerce").round(decimals)
+    return view
+
+
+def format_report_tables(
+    sigma_grain_df: pd.DataFrame,
+    sigma_universal_df: pd.DataFrame,
+    diameter_grain_df: pd.DataFrame,
+    diameter_universal_df: pd.DataFrame,
+    sigma_rounding_df: pd.DataFrame,
+    diameter_rounding_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    sigma_grain_fmt = sigma_grain_df.copy()
+    sigma_grain_fmt = round_if_present(sigma_grain_fmt, ["Размер зерна, мм", "log(A)", "p", "m", "R² по T", "R² по cσ", "RMSE по cσ, %", "MAE по cσ, %", "MAPE по cσ, %"], 2)
+    sigma_grain_fmt = round_if_present(sigma_grain_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %"], 0)
+
+    sigma_universal_fmt = sigma_universal_df.copy()
+    sigma_universal_fmt = round_if_present(sigma_universal_fmt, ["alpha0", "alpha1", "alpha2", "p", "m", "R² для log(A)(dg)", "R² по T"], 2)
+    sigma_universal_fmt = round_if_present(sigma_universal_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %"], 0)
+
+    diameter_grain_fmt = diameter_grain_df.copy()
+    diameter_grain_fmt = round_if_present(diameter_grain_fmt, ["Размер зерна, мм", "a", "b", "c", "R² по T"], 2)
+    diameter_grain_fmt = round_if_present(diameter_grain_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %"], 0)
+
+    diameter_universal_fmt = diameter_universal_df.copy()
+    diameter_universal_fmt = round_if_present(diameter_universal_fmt, ["alpha0", "alpha1", "alpha2", "beta0", "beta1", "beta2", "gamma0", "gamma1", "gamma2"], 4)
+    diameter_universal_fmt = round_if_present(diameter_universal_fmt, ["R² для a(dg)", "R² для b(dg)", "R² для c(dg)", "R² по T"], 2)
+    diameter_universal_fmt = round_if_present(diameter_universal_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %"], 0)
+
+    sigma_rounding_fmt = sigma_rounding_df.copy()
+    sigma_rounding_fmt = round_if_present(sigma_rounding_fmt, ["R² по T", "ΔR²"], 2)
+    sigma_rounding_fmt = round_if_present(sigma_rounding_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %", "ΔRMSE, °C", "ΔMAE, °C", "ΔMAPE, %"], 0)
+
+    diameter_rounding_fmt = diameter_rounding_df.copy()
+    diameter_rounding_fmt = round_if_present(diameter_rounding_fmt, ["R² по T", "ΔR²"], 2)
+    diameter_rounding_fmt = round_if_present(diameter_rounding_fmt, ["RMSE по T, °C", "MAE по T, °C", "MAPE по T, %", "ΔRMSE, °C", "ΔMAE, °C", "ΔMAPE, %"], 0)
+
+    return sigma_grain_fmt, sigma_universal_fmt, diameter_grain_fmt, diameter_universal_fmt, sigma_rounding_fmt, diameter_rounding_fmt
+
+
 def build_dataset_summary(prepared_df: pd.DataFrame, valid_grains: list[float]) -> tuple[pd.DataFrame, pd.DataFrame]:
     summary_df = pd.DataFrame(
         [
@@ -1839,6 +1883,21 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
 
     sigma_rounding_df = build_sigma_rounding_analysis(sigma_params, cleaned_sigma_results)
     diameter_rounding_df = build_diameter_rounding_analysis(diameter_params, cleaned_diameter_results)
+    (
+        sigma_grain_df_fmt,
+        sigma_universal_df_fmt,
+        diameter_grain_df_fmt,
+        diameter_universal_df_fmt,
+        sigma_rounding_df_fmt,
+        diameter_rounding_df_fmt,
+    ) = format_report_tables(
+        sigma_grain_df,
+        sigma_universal_df,
+        diameter_grain_df,
+        diameter_universal_df,
+        sigma_rounding_df,
+        diameter_rounding_df,
+    )
 
     st.markdown("**1. Общая сводка по выборке**")
     st.dataframe(dataset_summary_df, use_container_width=True, hide_index=True)
@@ -1847,34 +1906,34 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
     st.dataframe(dataset_by_grain_df, use_container_width=True, hide_index=True)
 
     st.markdown("**3. Локальные sigma-модели по зернам**")
-    st.dataframe(sigma_grain_df, use_container_width=True, hide_index=True)
+    st.dataframe(sigma_grain_df_fmt, use_container_width=True, hide_index=True)
 
     st.markdown("**4. Универсальная sigma-модель**")
-    st.dataframe(sigma_universal_df, use_container_width=True, hide_index=True)
+    st.dataframe(sigma_universal_df_fmt, use_container_width=True, hide_index=True)
 
     st.markdown("**5. Локальные модели роста диаметра по зернам**")
-    st.dataframe(diameter_grain_df, use_container_width=True, hide_index=True)
+    st.dataframe(diameter_grain_df_fmt, use_container_width=True, hide_index=True)
 
     st.markdown("**6. Универсальная модель роста диаметра**")
-    st.dataframe(diameter_universal_df, use_container_width=True, hide_index=True)
+    st.dataframe(diameter_universal_df_fmt, use_container_width=True, hide_index=True)
 
     st.markdown("**7. Анализ округления коэффициентов универсальной sigma-модели**")
     st.caption("Сравнение качества модели при последовательном сокращении числа знаков после запятой у итоговых коэффициентов.")
-    st.dataframe(sigma_rounding_df, use_container_width=True, hide_index=True)
+    st.dataframe(sigma_rounding_df_fmt, use_container_width=True, hide_index=True)
 
     st.markdown("**8. Анализ округления коэффициентов универсальной модели роста диаметра**")
     st.caption("Таблица помогает выбрать минимальную длину записи коэффициентов без заметной потери точности.")
-    st.dataframe(diameter_rounding_df, use_container_width=True, hide_index=True)
+    st.dataframe(diameter_rounding_df_fmt, use_container_width=True, hide_index=True)
 
     export_text = build_report_export_text(
         dataset_summary_df,
         dataset_by_grain_df,
-        sigma_grain_df,
-        sigma_universal_df,
-        diameter_grain_df,
-        diameter_universal_df,
-        sigma_rounding_df,
-        diameter_rounding_df,
+        sigma_grain_df_fmt,
+        sigma_universal_df_fmt,
+        diameter_grain_df_fmt,
+        diameter_universal_df_fmt,
+        sigma_rounding_df_fmt,
+        diameter_rounding_df_fmt,
     )
     with st.expander("Текстовый экспорт для ассистента"):
         st.caption("Этот блок можно целиком скопировать и прислать в чат для подготовки научного отчета.")
