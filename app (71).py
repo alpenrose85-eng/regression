@@ -1451,7 +1451,7 @@ def build_sigma_coefficient_df(
 def predict_temperature_diameter_universal(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
     ln_g = np.log(grain_size_mm)
     a_val = params["alpha0"] + params["alpha1"] * ln_g + params["alpha2"] * (ln_g ** 2)
-    if np.isfinite(params.get("b_const", np.nan)):
+    if is_finite_number(params.get("b_const", np.nan)):
         b_val = params["b_const"]
     else:
         b_val = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
@@ -1557,6 +1557,13 @@ def format_temperature_interpretation(temp_value: float, min_valid_temp: float =
     if temp_value < min_valid_temp:
         return f"< {min_valid_temp:.0f} °C (вне физически обоснованной области)"
     return f"{temp_value:.4f}"
+
+
+def is_finite_number(value: object) -> bool:
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
 
 
 def add_temperature_interpretation_column(
@@ -1856,7 +1863,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
             p = diameter_payload["params"]
             b_line = (
                 f"b(dg) = {p['beta0']:.8f} + ({p['beta1']:.8f}) · ln(dg) + ({p['beta2']:.8f}) · [ln(dg)]²"
-                if not np.isfinite(p.get("b_const", np.nan))
+                if not is_finite_number(p.get("b_const", np.nan))
                 else f"b = {p['b_const']:.10f}"
             )
             st.code(
@@ -2394,7 +2401,7 @@ with diameter_tab:
                             "R² для a(dg)": item["params"]["r2_a"],
                             "R² для b(dg)": item["params"]["r2_b"],
                             "R² для c(dg)": item["params"]["r2_c"],
-                            "b": item["params"]["b_const"] if np.isfinite(item["params"].get("b_const", np.nan)) else np.nan,
+                            "b": item["params"]["b_const"] if is_finite_number(item["params"].get("b_const", np.nan)) else np.nan,
                             "R² по T": item["eval"]["R² по T"],
                             "RMSE по T, °C": item["eval"]["RMSE по T, °C"],
                             "Количество точек": item["eval"]["Количество точек"],
@@ -2416,7 +2423,7 @@ with diameter_tab:
                 b_line = (
                     "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²\n"
                     f"beta0 = {universal_params['beta0']:.8f}, beta1 = {universal_params['beta1']:.8f}, beta2 = {universal_params['beta2']:.8f}"
-                    if not np.isfinite(universal_params.get("b_const", np.nan))
+                    if not is_finite_number(universal_params.get("b_const", np.nan))
                     else f"b = {universal_params['b_const']:.10f}"
                 )
                 formula_text = (
