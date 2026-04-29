@@ -1721,6 +1721,19 @@ def build_dataset_summary(prepared_df: pd.DataFrame, valid_grains: list[float]) 
     return summary_df, per_grain_df
 
 
+def build_grain_size_mapping_df(valid_grains: list[float] | None = None) -> pd.DataFrame:
+    rows = []
+    grains = sorted(valid_grains) if valid_grains else sorted(GRAIN_SIZE_MM.keys())
+    for grain in grains:
+        rows.append(
+            {
+                "Номер зерна G": float(grain),
+                "Размер зерна d_g, мм": float(GRAIN_SIZE_MM.get(float(grain), np.nan)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def build_sigma_grain_report(cleaned_sigma_results: dict[float, FitResult]) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     for grain in sorted(cleaned_sigma_results.keys()):
@@ -1904,6 +1917,7 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
         return
 
     dataset_summary_df, dataset_by_grain_df = build_dataset_summary(prepared_df, valid_grains)
+    grain_size_mapping_df = build_grain_size_mapping_df(valid_grains)
     cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
     cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
 
@@ -2004,6 +2018,9 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
 
     st.markdown("**2. Выборка по номерам зерна**")
     st.dataframe(dataset_by_grain_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**2а. Соответствие номера зерна G и размера зерна d_g**")
+    st.dataframe(grain_size_mapping_df, use_container_width=True, hide_index=True)
 
     st.markdown("**3. Локальные sigma-модели по зернам**")
     st.dataframe(sigma_grain_df_fmt, use_container_width=True, hide_index=True)
@@ -2239,6 +2256,10 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
     if not valid_grains:
         st.warning("Для построения универсальных моделей недостаточно зерновых наборов с минимум 7 точками.")
         return
+
+    st.markdown("**Соответствие номера зерна и физического размера зерна**")
+    st.caption("В универсальных моделях в коэффициенты подставляется не номер зерна G напрямую, а соответствующий ему физический размер зерна d_g.")
+    st.dataframe(build_grain_size_mapping_df(valid_grains), use_container_width=True, hide_index=True)
 
     recommended_diameter_exclusions = get_recommended_diameter_exclusions(prepared_df, valid_grains)
     recommended_sigma_exclusions = get_recommended_sigma_exclusions(prepared_df, valid_grains)
