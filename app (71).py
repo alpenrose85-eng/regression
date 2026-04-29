@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import Iterable
 
 import matplotlib.pyplot as plt
@@ -1557,6 +1557,231 @@ def add_temperature_interpretation_column(
     return view
 
 
+def dataframe_to_tsv_text(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "[пусто]"
+    buffer = StringIO()
+    df.to_csv(buffer, sep="\t", index=False)
+    return buffer.getvalue().strip()
+
+
+def build_dataset_summary(prepared_df: pd.DataFrame, valid_grains: list[float]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    summary_df = pd.DataFrame(
+        [
+            {
+                "Всего точек": int(len(prepared_df)),
+                "Число номеров зерна": int(prepared_df["G"].nunique()),
+                "Номера зерна для моделирования": ", ".join(str(int(g)) if float(g).is_integer() else str(g) for g in valid_grains),
+                "T_min, °C": float(prepared_df["T"].min()),
+                "T_max, °C": float(prepared_df["T"].max()),
+                "tau_min": float(prepared_df["tau"].min()),
+                "tau_max": float(prepared_df["tau"].max()),
+                "cσ_min, %": float(prepared_df["c_sigma"].min()),
+                "cσ_max, %": float(prepared_df["c_sigma"].max()),
+                "D_min": float(prepared_df["D"].min()),
+                "D_max": float(prepared_df["D"].max()),
+            }
+        ]
+    )
+    per_grain_df = (
+        prepared_df.groupby("G", dropna=True)
+        .agg(
+            **{
+                "Количество точек": ("G", "size"),
+                "T_min, °C": ("T", "min"),
+                "T_max, °C": ("T", "max"),
+                "tau_min": ("tau", "min"),
+                "tau_max": ("tau", "max"),
+                "cσ_min, %": ("c_sigma", "min"),
+                "cσ_max, %": ("c_sigma", "max"),
+                "D_min": ("D", "min"),
+                "D_max": ("D", "max"),
+            }
+        )
+        .reset_index()
+        .rename(columns={"G": "Номер зерна"})
+        .sort_values(by=["Номер зерна"])
+        .reset_index(drop=True)
+    )
+    return summary_df, per_grain_df
+
+
+def build_sigma_grain_report(cleaned_sigma_results: dict[float, FitResult]) -> pd.DataFrame:
+    rows: list[dict[str, float]] = []
+    for grain in sorted(cleaned_sigma_results.keys()):
+        result = cleaned_sigma_results[grain]
+        params = result.params.set_index("Параметр модели")["Значение"].to_dict()
+        temp_metrics = temperature_metric_summary(result.data)
+        sigma_metrics = sigma_metric_summary(result.data)
+        rows.append(
+            {
+                "Номер зерна": float(grain),
+                "Размер зерна, мм": float(GRAIN_SIZE_MM.get(float(grain), np.nan)),
+                "Количество точек": float(result.metrics.get("Количество точек", len(result.data))),
+                "log(A)": float(params.get("log_a", np.nan)),
+                "p": float(params.get("p_exp", np.nan)),
+                "m": float(params.get("m_exp", np.nan)),
+                "R² по T": float(temp_metrics.get("R² по T", np.nan)),
+                "RMSE по T, °C": float(temp_metrics.get("RMSE по T, °C", np.nan)),
+                "MAE по T, °C": float(temp_metrics.get("MAE по T, °C", np.nan)),
+                "MAPE по T, %": float(temp_metrics.get("MAPE по T, %", np.nan)),
+                "R² по cσ": float(sigma_metrics.get("R² по cσ", np.nan)),
+                "RMSE по cσ, %": float(sigma_metrics.get("RMSE по cσ, %", np.nan)),
+                "MAE по cσ, %": float(sigma_metrics.get("MAE по cσ, %", np.nan)),
+                "MAPE по cσ, %": float(sigma_metrics.get("MAPE по cσ, %", np.nan)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_diameter_grain_report(cleaned_diameter_results: dict[float, FitResult]) -> pd.DataFrame:
+    rows: list[dict[str, float]] = []
+    for grain in sorted(cleaned_diameter_results.keys()):
+        result = cleaned_diameter_results[grain]
+        params = result.params.set_index("Параметр модели")["Значение"].to_dict()
+        rows.append(
+            {
+                "Номер зерна": float(grain),
+                "Размер зерна, мм": float(GRAIN_SIZE_MM.get(float(grain), np.nan)),
+                "Количество точек": float(result.metrics.get("Количество точек", len(result.data))),
+                "a": float(params.get("const", np.nan)),
+                "b": float(params.get("ln_tau", np.nan)),
+                "c": float(params.get("inv_T", np.nan)),
+                "R² по T": float(result.metrics.get("R²", np.nan)),
+                "RMSE по T, °C": float(result.metrics.get("RMSE, °C", np.nan)),
+                "MAE по T, °C": float(result.metrics.get("MAE, °C", np.nan)),
+                "MAPE по T, %": float(result.metrics.get("MAPE, %", np.nan)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_report_export_text(
+    dataset_summary_df: pd.DataFrame,
+    dataset_by_grain_df: pd.DataFrame,
+    sigma_grain_df: pd.DataFrame,
+    sigma_universal_df: pd.DataFrame,
+    diameter_grain_df: pd.DataFrame,
+    diameter_universal_df: pd.DataFrame,
+) -> str:
+    sections = [
+        "[ОБЩАЯ СВОДКА ПО ВЫБОРКЕ]",
+        dataframe_to_tsv_text(dataset_summary_df),
+        "",
+        "[ВЫБОРКА ПО НОМЕРАМ ЗЕРНА]",
+        dataframe_to_tsv_text(dataset_by_grain_df),
+        "",
+        "[ЛОКАЛЬНЫЕ SIGMA-МОДЕЛИ ПО ЗЕРНАМ]",
+        dataframe_to_tsv_text(sigma_grain_df),
+        "",
+        "[УНИВЕРСАЛЬНАЯ SIGMA-МОДЕЛЬ]",
+        dataframe_to_tsv_text(sigma_universal_df),
+        "",
+        "[ЛОКАЛЬНЫЕ МОДЕЛИ РОСТА ДИАМЕТРА ПО ЗЕРНАМ]",
+        dataframe_to_tsv_text(diameter_grain_df),
+        "",
+        "[УНИВЕРСАЛЬНАЯ МОДЕЛЬ РОСТА ДИАМЕТРА]",
+        dataframe_to_tsv_text(diameter_universal_df),
+    ]
+    return "\n".join(sections)
+
+
+def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float]) -> None:
+    st.subheader("Данные для научного отчета / диссертации")
+    st.caption("Вкладка собирает ключевые таблицы по выборке, локальным и универсальным моделям в удобном для копирования виде.")
+
+    if not valid_grains:
+        st.warning("Для подготовки отчета недостаточно зерновых наборов с минимум 7 точками.")
+        return
+
+    dataset_summary_df, dataset_by_grain_df = build_dataset_summary(prepared_df, valid_grains)
+    cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
+    cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
+
+    sigma_grain_df = build_sigma_grain_report(cleaned_sigma_results)
+    diameter_grain_df = build_diameter_grain_report(cleaned_diameter_results)
+
+    sigma_params, _, _ = fit_sigma_universal_grain_size_model(cleaned_sigma_results, variant="median_constants")
+    sigma_eval = evaluate_sigma_universal_model(sigma_params, cleaned_sigma_results)
+    sigma_universal_df = pd.DataFrame(
+        [
+            {
+                "Формула": "cσ = A(dg) · τ^p · ((T - 550) / 350)^m",
+                "alpha0": float(sigma_params["alpha0"]),
+                "alpha1": float(sigma_params["alpha1"]),
+                "alpha2": float(sigma_params["alpha2"]),
+                "p": float(sigma_params["p_const"]),
+                "m": float(sigma_params["m_const"]),
+                "R² для log(A)(dg)": float(sigma_params["r2_log_a"]),
+                "R² по T": float(sigma_eval["R² по T"]),
+                "RMSE по T, °C": float(sigma_eval["RMSE по T, °C"]),
+                "MAE по T, °C": float(sigma_eval["MAE по T, °C"]),
+                "MAPE по T, %": float(sigma_eval["MAPE по T, %"]),
+                "Количество зерновых моделей": float(sigma_eval["Количество зерновых моделей"]),
+                "Количество точек": float(sigma_eval["Количество точек"]),
+            }
+        ]
+    )
+
+    diameter_params, _, _ = fit_diameter_universal_grain_size_model(cleaned_diameter_results, variant="quadratic_full")
+    diameter_eval = evaluate_diameter_universal_model(diameter_params, cleaned_diameter_results)
+    diameter_universal_df = pd.DataFrame(
+        [
+            {
+                "Формула": "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))",
+                "alpha0": float(diameter_params["alpha0"]),
+                "alpha1": float(diameter_params["alpha1"]),
+                "alpha2": float(diameter_params["alpha2"]),
+                "beta0": float(diameter_params["beta0"]),
+                "beta1": float(diameter_params["beta1"]),
+                "beta2": float(diameter_params["beta2"]),
+                "gamma0": float(diameter_params["gamma0"]),
+                "gamma1": float(diameter_params["gamma1"]),
+                "gamma2": float(diameter_params["gamma2"]),
+                "R² для a(dg)": float(diameter_params["r2_a"]),
+                "R² для b(dg)": float(diameter_params["r2_b"]),
+                "R² для c(dg)": float(diameter_params["r2_c"]),
+                "R² по T": float(diameter_eval["R² по T"]),
+                "RMSE по T, °C": float(diameter_eval["RMSE по T, °C"]),
+                "MAE по T, °C": float(diameter_eval["MAE по T, °C"]),
+                "MAPE по T, %": float(diameter_eval["MAPE по T, %"]),
+                "Количество зерновых моделей": float(diameter_eval["Количество зерновых моделей"]),
+                "Количество точек": float(diameter_eval["Количество точек"]),
+            }
+        ]
+    )
+
+    st.markdown("**1. Общая сводка по выборке**")
+    st.dataframe(dataset_summary_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**2. Выборка по номерам зерна**")
+    st.dataframe(dataset_by_grain_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**3. Локальные sigma-модели по зернам**")
+    st.dataframe(sigma_grain_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**4. Универсальная sigma-модель**")
+    st.dataframe(sigma_universal_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**5. Локальные модели роста диаметра по зернам**")
+    st.dataframe(diameter_grain_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**6. Универсальная модель роста диаметра**")
+    st.dataframe(diameter_universal_df, use_container_width=True, hide_index=True)
+
+    export_text = build_report_export_text(
+        dataset_summary_df,
+        dataset_by_grain_df,
+        sigma_grain_df,
+        sigma_universal_df,
+        diameter_grain_df,
+        diameter_universal_df,
+    )
+    with st.expander("Текстовый экспорт для ассистента"):
+        st.caption("Этот блок можно целиком скопировать и прислать в чат для подготовки научного отчета.")
+        st.text_area("Скопируйте данные ниже", export_text, height=500, key="report_export_text")
+
+
 def clear_sigma_when_diameter_entered() -> None:
     if str(st.session_state.get("universal_choice_d", "")).strip():
         st.session_state["universal_choice_sigma"] = ""
@@ -2155,7 +2380,7 @@ if diameter_result is not None:
 if anchor_result is not None:
     enrich_real_point_metrics(anchor_result, predict_temperature_anchor_saturation)
 
-main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab, universal_models_tab = st.tabs([
+main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab, universal_models_tab, report_tab = st.tabs([
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
@@ -2164,6 +2389,7 @@ main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calcul
     "Сравнение моделей",
     "Калькулятор",
     "Универсальные модели",
+    "Данные для отчета",
 ])
 
 with main_tab:
@@ -2670,3 +2896,6 @@ with calculator_tab:
 
 with universal_models_tab:
     render_universal_models_tab(prepared_df, valid_grains)
+
+with report_tab:
+    render_report_data_tab(prepared_df, valid_grains)
