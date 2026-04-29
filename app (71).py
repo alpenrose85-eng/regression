@@ -1757,6 +1757,40 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         st.warning("Для построения универсальных моделей недостаточно зерновых наборов с минимум 7 точками.")
         return
 
+    recommended_diameter_exclusions = get_recommended_diameter_exclusions(prepared_df, valid_grains)
+    recommended_sigma_exclusions = get_recommended_sigma_exclusions(prepared_df, valid_grains)
+
+    st.caption(
+        "Если нажать кнопку ниже, программа автоматически применит все рекомендованные исключения по локальным моделям зерна "
+        "и пересчитает универсальные модели. Если кнопку не нажимать, можно удалять точки вручную в разделах отдельных номеров зерна."
+    )
+    c_apply_all, c_reset_all = st.columns(2)
+    with c_apply_all:
+        if st.button("Удалить все предложенные точки", key="apply_all_universal_model_exclusions"):
+            for grain in valid_grains:
+                st.session_state[f"applied_exclude_diameter_grain_{grain}"] = list(recommended_diameter_exclusions.get(grain, []))
+                st.session_state[f"applied_exclude_sigma_grain_{grain}"] = list(recommended_sigma_exclusions.get(grain, []))
+            st.rerun()
+    with c_reset_all:
+        if st.button("Сбросить все автоисключения", key="reset_all_universal_model_exclusions"):
+            for grain in valid_grains:
+                st.session_state[f"applied_exclude_diameter_grain_{grain}"] = []
+                st.session_state[f"applied_exclude_sigma_grain_{grain}"] = []
+            st.rerun()
+
+    exclusion_rows = []
+    for grain in valid_grains:
+        exclusion_rows.append(
+            {
+                "Номер зерна": grain,
+                "Предложено удалить (диаметр)": len(recommended_diameter_exclusions.get(grain, [])),
+                "Сейчас исключено (диаметр)": len(st.session_state.get(f"applied_exclude_diameter_grain_{grain}", [])),
+                "Предложено удалить (sigma)": len(recommended_sigma_exclusions.get(grain, [])),
+                "Сейчас исключено (sigma)": len(st.session_state.get(f"applied_exclude_sigma_grain_{grain}", [])),
+            }
+        )
+    st.dataframe(pd.DataFrame(exclusion_rows), use_container_width=True, hide_index=True)
+
     diameter_error_local = None
     sigma_error_local = None
     diameter_payload = None
