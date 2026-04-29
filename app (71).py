@@ -999,8 +999,13 @@ def show_sigma_grain_block(result: FitResult, grain_value: float, grain_df: pd.D
 
     if apply_key not in st.session_state:
         st.session_state[apply_key] = []
+    pending_sync_key = f"pending_sync_sigma_grain_{grain_value}"
+    desired_selection = [pid for pid in st.session_state.get(apply_key, []) if pid in source_point_ids]
     if widget_key not in st.session_state:
-        st.session_state[widget_key] = list(st.session_state[apply_key])
+        st.session_state[widget_key] = list(desired_selection)
+    elif st.session_state.get(pending_sync_key):
+        st.session_state[widget_key] = list(desired_selection)
+        st.session_state[pending_sync_key] = False
 
     active_result = result
     effective_selected = [pid for pid in st.session_state.get(apply_key, []) if pid in source_point_ids]
@@ -1026,11 +1031,12 @@ def show_sigma_grain_block(result: FitResult, grain_value: float, grain_df: pd.D
         with c_apply_user:
             if st.button("Применить выбранные точки", key=f"apply_sigma_grain_{grain_value}"):
                 st.session_state[apply_key] = [pid for pid in st.session_state.get(widget_key, []) if pid in source_point_ids]
+                st.session_state[pending_sync_key] = True
                 st.rerun()
         with c_reset:
             if st.button("Сбросить исключения", key=f"reset_sigma_grain_{grain_value}"):
                 st.session_state[apply_key] = []
-                st.session_state[widget_key] = []
+                st.session_state[pending_sync_key] = True
                 st.rerun()
 
         st.multiselect(
@@ -2389,16 +2395,15 @@ with anchor_tab:
                     for grain in selected_grains_for_recommended:
                         labels = recommended_exclusions.get(grain, [])
                         apply_key = f"applied_exclude_sigma_grain_{grain}"
-                        widget_key = f"exclude_sigma_grain_{grain}"
                         merged = sorted(set(st.session_state.get(apply_key, [])) | set(labels))
                         st.session_state[apply_key] = merged
-                        st.session_state[widget_key] = merged
+                        st.session_state[f"pending_sync_sigma_grain_{grain}"] = True
                     st.rerun()
             with c_reset_all:
                 if st.button("Сбросить все исключения по sigma-модели", key="reset_all_sigma_exclusions"):
                     for grain in valid_grains:
                         st.session_state[f"applied_exclude_sigma_grain_{grain}"] = []
-                        st.session_state[f"exclude_sigma_grain_{grain}"] = []
+                        st.session_state[f"pending_sync_sigma_grain_{grain}"] = True
                     st.rerun()
 
             active_rows = []
