@@ -1544,9 +1544,9 @@ def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results:
 
 def predict_temperature_sigma_formula(grain_number: float, c_sigma: float, tau: float) -> float:
     if c_sigma <= 0:
-        raise ValueError("Для sigma-формулы содержание sigma-фазы должно быть больше нуля.")
+        raise ValueError("Для второй модели по проценту содержание sigma-фазы должно быть больше нуля.")
     if tau <= 0:
-        raise ValueError("Для sigma-формулы время должно быть больше нуля.")
+        raise ValueError("Для второй модели по проценту время должно быть больше нуля.")
     if float(grain_number) not in GRAIN_SIZE_MM:
         raise ValueError("Sigma-формула поддерживает только номера зерна 3, 4, 5, 6, 7, 8, 9 и 10.")
     g26 = -4.0 * float(grain_number) ** 2 - 36.848 * float(grain_number) + 1941.6
@@ -1559,7 +1559,7 @@ def build_sigma_formula_evaluation(prepared_df: pd.DataFrame) -> tuple[pd.DataFr
     if selected:
         eval_df = eval_df[~eval_df["point_id"].astype(str).isin(selected)].copy()
     if eval_df.empty:
-        raise ValueError("Нет точек с поддерживаемыми номерами зерна для sigma-формулы.")
+        raise ValueError("Нет точек с поддерживаемыми номерами зерна для второй модели по проценту.")
 
     eval_df["T_pred_universal"] = eval_df.apply(
         lambda row: predict_temperature_sigma_formula(float(row["G"]), float(row["c_sigma"]), float(row["tau"])),
@@ -2415,7 +2415,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
         )
     st.dataframe(pd.DataFrame(exclusion_rows), use_container_width=True, hide_index=True)
     st.caption(
-        f"Для формулы температуры по sigma-фазе рекомендовано исключить: {len(sigma_formula_recommended_labels)}; "
+        f"Для второй модели по проценту рекомендовано исключить: {len(sigma_formula_recommended_labels)}; "
         f"сейчас исключено: {len(st.session_state.get('applied_exclude_sigma_formula', []))}."
     )
 
@@ -2495,7 +2495,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
     if sigma_formula_eval is not None:
         quality_rows.append(
             {
-                "Модель": "Температура по sigma-фазе",
+                "Модель": "Вторая модель по проценту",
                 "Версия": "T = G26 · (cσ / √τ)^0.192",
                 "R² по T": sigma_formula_eval["R² по T"],
                 "RMSE по T, °C": sigma_formula_eval["RMSE по T, °C"],
@@ -2550,9 +2550,9 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 st.text(selected_sigma_variant["summary"])
 
     with col_right:
-        st.subheader("Формула температуры по sigma-фазе")
+        st.subheader("Формула второй модели по проценту")
         if sigma_formula_eval is None:
-            st.error(f"Формула температуры по sigma-фазе недоступна: {sigma_formula_error}")
+            st.error(f"Вторая модель по проценту недоступна: {sigma_formula_error}")
         else:
             st.code(
                 "\n".join(
@@ -2569,70 +2569,26 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 f"RMSE={sigma_formula_eval['RMSE по T, °C']:.4f} °C, точек={int(sigma_formula_eval['Количество точек'])}."
             )
 
-    st.subheader("Температура по sigma-фазе: все точки и рекомендации по исключению")
+    st.subheader("Исключение точек для второй модели по проценту")
     if sigma_formula_eval is None:
-        st.error(f"Не удалось оценить формулу температуры по sigma-фазе: {sigma_formula_error}")
+        st.error(f"Не удалось оценить вторую модель по проценту: {sigma_formula_error}")
     else:
-        sigma_formula_df, _, sigma_formula_recommendation_df = build_sigma_formula_evaluation(prepared_df)
-        if not sigma_formula_recommendation_df.empty:
-            st.warning("Ниже точки, которые система рекомендует проверить или временно исключить из sigma-формулы.")
         sigma_formula_options = prepared_df[prepared_df["G"].isin(sorted(GRAIN_SIZE_MM.keys()))]["point_id"].astype(str).tolist()
         selected_sigma_formula = st.multiselect(
-            "Исключить точки из sigma-формулы",
+            "Исключить точки из второй модели по проценту",
             options=sigma_formula_options,
             default=st.session_state.get("applied_exclude_sigma_formula", sigma_formula_recommended_labels),
             key="exclude_sigma_formula",
         )
         c_apply_formula, c_reset_formula = st.columns(2)
         with c_apply_formula:
-            if st.button("Применить исключение выбранных точек для sigma-формулы", key="apply_sigma_formula_exclusions"):
+            if st.button("Применить исключение выбранных точек для второй модели по проценту", key="apply_sigma_formula_exclusions"):
                 st.session_state["applied_exclude_sigma_formula"] = list(selected_sigma_formula)
                 st.rerun()
         with c_reset_formula:
-            if st.button("Сбросить исключения sigma-формулы", key="reset_sigma_formula_exclusions"):
+            if st.button("Сбросить исключения второй модели по проценту", key="reset_sigma_formula_exclusions"):
                 st.session_state["applied_exclude_sigma_formula"] = []
                 st.rerun()
-
-        st.dataframe(
-            sigma_formula_df[
-                ["point_id", "G", "tau", "c_sigma", "T", "T_pred_universal", "error_celsius", "abs_error", "rel_error_pct", "standard_residual"]
-            ].rename(
-                columns={
-                    "point_id": "Точка",
-                    "G": "Номер зерна",
-                    "tau": "τ",
-                    "c_sigma": "cσ, %",
-                    "T": "T факт, °C",
-                    "T_pred_universal": "T расчёт, °C",
-                    "error_celsius": "Ошибка, °C",
-                    "abs_error": "|Ошибка|, °C",
-                    "rel_error_pct": "Ошибка, %",
-                    "standard_residual": "Станд. остаток",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-        if not sigma_formula_recommendation_df.empty:
-            st.markdown("**Рекомендованные к проверке/удалению точки**")
-            st.dataframe(
-                sigma_formula_recommendation_df[
-                    ["point_id", "G", "T", "T_pred_universal", "error_celsius", "abs_error", "rel_error_pct", "standard_residual"]
-                ].rename(
-                    columns={
-                        "point_id": "Точка",
-                        "G": "Номер зерна",
-                        "T": "T факт, °C",
-                        "T_pred_universal": "T расчёт, °C",
-                        "error_celsius": "Ошибка, °C",
-                        "abs_error": "|Ошибка|, °C",
-                        "rel_error_pct": "Ошибка, %",
-                        "standard_residual": "Станд. остаток",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
 
     st.subheader("Калькулятор по универсальным моделям")
     st.caption("Можно ввести диаметр, процент σ-фазы или оба параметра сразу. Расчет запускается только по кнопке.")
@@ -2688,7 +2644,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 temp_sigma_formula = predict_temperature_sigma_formula(float(grain_number), round(sigma_value, 2), tau_value)
                 result_rows.append(
                     {
-                        "Модель": "Температура по sigma-фазе",
+                        "Модель": "Вторая модель по проценту",
                         "Расчетная температура, °C": temp_sigma_formula,
                         "Интерпретация": f"{temp_sigma_formula:.4f}",
                     }
@@ -2705,6 +2661,96 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
             st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
         except Exception as exc:
             st.error(f"Не удалось выполнить расчет: {exc}")
+
+
+def render_sigma_formula_tab(prepared_df: pd.DataFrame) -> None:
+    st.subheader("Вторая модель по проценту")
+    st.write(
+        "Отдельный раздел для второй модели по проценту: здесь собраны формула, качество, "
+        "таблица по всем точкам и рекомендации по исключению выбросов."
+    )
+
+    try:
+        sigma_formula_df, sigma_formula_metrics, sigma_formula_recommendation_df = build_sigma_formula_evaluation(prepared_df)
+    except Exception as exc:
+        st.error(f"Не удалось оценить вторую модель по проценту: {exc}")
+        return
+
+    st.code(
+        "\n".join(
+            [
+                "T = G26 · (cσ / √τ)^0.192",
+                "G26 = -4·G² - 36.848·G + 1941.6",
+                "G = 3, 4, 5, 6, 7, 8, 9, 10",
+            ]
+        ),
+        language="text",
+    )
+
+    metric_df = pd.DataFrame([sigma_formula_metrics])
+    st.dataframe(metric_df, use_container_width=True, hide_index=True)
+
+    if not sigma_formula_recommendation_df.empty:
+        st.warning("Ниже точки, которые система рекомендует проверить или временно исключить из второй модели по проценту.")
+    sigma_formula_options = prepared_df[prepared_df["G"].isin(sorted(GRAIN_SIZE_MM.keys()))]["point_id"].astype(str).tolist()
+    selected_sigma_formula = st.multiselect(
+        "Исключить точки из второй модели по проценту",
+        options=sigma_formula_options,
+        default=st.session_state.get("applied_exclude_sigma_formula", sigma_formula_recommendation_df["point_id"].astype(str).tolist()),
+        key="sigma_formula_tab_exclude",
+    )
+    c_apply_formula, c_reset_formula = st.columns(2)
+    with c_apply_formula:
+        if st.button("Применить исключение выбранных точек", key="sigma_formula_tab_apply"):
+            st.session_state["applied_exclude_sigma_formula"] = list(selected_sigma_formula)
+            st.rerun()
+    with c_reset_formula:
+        if st.button("Сбросить исключения", key="sigma_formula_tab_reset"):
+            st.session_state["applied_exclude_sigma_formula"] = []
+            st.rerun()
+
+    st.subheader("Таблица по всем точкам")
+    st.dataframe(
+        sigma_formula_df[
+            ["point_id", "G", "tau", "c_sigma", "T", "T_pred_universal", "error_celsius", "abs_error", "rel_error_pct", "standard_residual"]
+        ].rename(
+            columns={
+                "point_id": "Точка",
+                "G": "Номер зерна",
+                "tau": "τ",
+                "c_sigma": "cσ, %",
+                "T": "T факт, °C",
+                "T_pred_universal": "T расчёт, °C",
+                "error_celsius": "Ошибка, °C",
+                "abs_error": "|Ошибка|, °C",
+                "rel_error_pct": "Ошибка, %",
+                "standard_residual": "Станд. остаток",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if not sigma_formula_recommendation_df.empty:
+        st.subheader("Рекомендованные к проверке/удалению точки")
+        st.dataframe(
+            sigma_formula_recommendation_df[
+                ["point_id", "G", "T", "T_pred_universal", "error_celsius", "abs_error", "rel_error_pct", "standard_residual"]
+            ].rename(
+                columns={
+                    "point_id": "Точка",
+                    "G": "Номер зерна",
+                    "T": "T факт, °C",
+                    "T_pred_universal": "T расчёт, °C",
+                    "error_celsius": "Ошибка, °C",
+                    "abs_error": "|Ошибка|, °C",
+                    "rel_error_pct": "Ошибка, %",
+                    "standard_residual": "Станд. остаток",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def show_result_block(
@@ -2899,7 +2945,7 @@ if diameter_result is not None:
 if anchor_result is not None:
     enrich_real_point_metrics(anchor_result, predict_temperature_anchor_saturation)
 
-main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab, universal_models_tab, report_tab = st.tabs([
+main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab, universal_models_tab, sigma_formula_tab, report_tab = st.tabs([
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
@@ -2908,6 +2954,7 @@ main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calcul
     "Сравнение моделей",
     "Калькулятор",
     "Универсальные модели",
+    "Вторая модель по проценту",
     "Данные для отчета",
 ])
 
@@ -3415,6 +3462,9 @@ with calculator_tab:
 
 with universal_models_tab:
     render_universal_models_tab(prepared_df, valid_grains)
+
+with sigma_formula_tab:
+    render_sigma_formula_tab(prepared_df)
 
 with report_tab:
     render_report_data_tab(prepared_df, valid_grains)
