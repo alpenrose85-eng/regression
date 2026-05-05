@@ -1155,6 +1155,25 @@ def predict_temperature_diameter_growth(params: dict[str, float], D: float, tau:
     return 1.0 / inv_t - 273.15
 
 
+def predict_temperature_diameter_grain_model(
+    params: dict[str, float], D: float, tau: float, G: float | None = None
+) -> float:
+    if all(key in params for key in ["const", "ln_tau", "inv_T"]):
+        grain_params = params
+    else:
+        if G is None:
+            raise ValueError("Для модели роста диаметра по зернам нужно указать номер зерна G.")
+        grain_key = f"grain_{float(G)}_"
+        grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
+        if not grain_params:
+            grain_key = f"grain_{int(round(float(G)))}_"
+            grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
+        if not grain_params:
+            raise ValueError(f"Для номера зерна G={G} нет отдельной модели роста диаметра.")
+
+    return predict_temperature_diameter_growth(grain_params, D, tau)
+
+
 def build_cleaned_diameter_grain_results(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, FitResult]:
     cleaned_results: dict[float, FitResult] = {}
     for grain in valid_grains:
@@ -1516,6 +1535,36 @@ def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results:
     return {
         "Количество точек": float(total_points),
         "Количество зерновых моделей": float(total_models),
+        "R² по T": float(r2_score(eval_df["T"], eval_df["T_pred_universal"])) if len(eval_df) >= 2 else np.nan,
+        "RMSE по T, °C": float(np.sqrt(mean_squared_error(eval_df["T"], eval_df["T_pred_universal"]))),
+        "MAE по T, °C": float(mean_absolute_error(eval_df["T"], eval_df["T_pred_universal"])),
+        "MAPE по T, %": float(np.mean(np.abs(errors) / np.maximum(np.abs(eval_df["T"]), 1e-9)) * 100.0),
+    }
+
+
+def predict_temperature_sigma_formula(grain_number: float, c_sigma: float, tau: float) -> float:
+    if c_sigma <= 0:
+        raise ValueError("Для sigma-формулы содержание sigma-фазы должно быть больше нуля.")
+    if tau <= 0:
+        raise ValueError("Для sigma-формулы время должно быть больше нуля.")
+    if float(grain_number) not in GRAIN_SIZE_MM:
+        raise ValueError("Sigma-формула поддерживает только номера зерна 3, 4, 5, 6, 7, 8, 9 и 10.")
+    g26 = -4.0 * float(grain_number) ** 2 - 36.848 * float(grain_number) + 1941.6
+    return float(g26 * np.power(float(c_sigma) / np.sqrt(float(tau)), 0.192))
+
+
+def evaluate_sigma_formula_model(prepared_df: pd.DataFrame) -> dict[str, float]:
+    eval_df = prepared_df[prepared_df["G"].isin(sorted(GRAIN_SIZE_MM.keys()))].copy()
+    if eval_df.empty:
+        raise ValueError("Нет точек с поддерживаемыми номерами зерна для sigma-формулы.")
+    eval_df["T_pred_universal"] = eval_df.apply(
+        lambda row: predict_temperature_sigma_formula(float(row["G"]), float(row["c_sigma"]), float(row["tau"])),
+        axis=1,
+    )
+    errors = eval_df["T"] - eval_df["T_pred_universal"]
+    return {
+        "Количество точек": float(len(eval_df)),
+        "Количество зерновых моделей": float(eval_df["G"].nunique()),
         "R² по T": float(r2_score(eval_df["T"], eval_df["T_pred_universal"])) if len(eval_df) >= 2 else np.nan,
         "RMSE по T, °C": float(np.sqrt(mean_squared_error(eval_df["T"], eval_df["T_pred_universal"]))),
         "MAE по T, °C": float(mean_absolute_error(eval_df["T"], eval_df["T_pred_universal"])),
@@ -2158,7 +2207,12 @@ def predict_temperature_anchor_saturation(
     return float(np.clip(550.0 + 350.0 * temp_norm, 550.0, 900.0))
 
 
-def show_model_comparison(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
+def show_model_comparison(
+    base_result: FitResult,
+    improved_result: FitResult,
+    anchor_result: FitResult,
+    diameter_result: FitResult | None = None,
+) -> None:
     st.subheader("Сравнение моделей")
     metric_order = [
         "R²",
@@ -2173,46 +2227,61 @@ def show_model_comparison(base_result: FitResult, improved_result: FitResult, an
         "Корреляция факт/модель",
         "Коэффициент достоверности аппроксимации, %",
     ]
-    comparison_df = pd.DataFrame(
-        {
-            "Метрика": metric_order,
-            "Базовая модель": [base_result.metrics.get(metric, np.nan) for metric in metric_order],
-            "Улучшенная модель": [improved_result.metrics.get(metric, np.nan) for metric in metric_order],
-            "Sigma-модель по зернам": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
-        }
-    )
+    comparison_payload = {
+        "Метрика": metric_order,
+        "Базовая модель": [base_result.metrics.get(metric, np.nan) for metric in metric_order],
+        "Улучшенная модель": [improved_result.metrics.get(metric, np.nan) for metric in metric_order],
+        "Sigma-модель по зернам": [anchor_result.metrics.get(metric, np.nan) for metric in metric_order],
+    }
+    if diameter_result is not None:
+        comparison_payload["Модель роста диаметра"] = [diameter_result.metrics.get(metric, np.nan) for metric in metric_order]
+    comparison_df = pd.DataFrame(comparison_payload)
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
 
-    anchor_compare = pd.DataFrame(
-        [
+    anchor_compare_rows = [
+        {
+            "Модель": "Базовая",
+            "Прогноз для реальной точки, °C": base_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
+            "Отклонение от диапазона 570–600 °C, °C": base_result.metrics.get(
+                "Отклонение реальной точки от диапазона, °C", np.nan
+            ),
+        },
+        {
+            "Модель": "Улучшенная",
+            "Прогноз для реальной точки, °C": improved_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
+            "Отклонение от диапазона 570–600 °C, °C": improved_result.metrics.get(
+                "Отклонение реальной точки от диапазона, °C", np.nan
+            ),
+        },
+        {
+            "Модель": "Sigma-модель по зернам",
+            "Прогноз для реальной точки, °C": anchor_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
+            "Отклонение от диапазона 570–600 °C, °C": anchor_result.metrics.get(
+                "Отклонение реальной точки от диапазона, °C", np.nan
+            ),
+        },
+    ]
+    if diameter_result is not None:
+        anchor_compare_rows.append(
             {
-                "Модель": "Базовая",
-                "Прогноз для реальной точки, °C": base_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
-                "Отклонение от диапазона 570–600 °C, °C": base_result.metrics.get(
+                "Модель": "Модель роста диаметра",
+                "Прогноз для реальной точки, °C": diameter_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
+                "Отклонение от диапазона 570–600 °C, °C": diameter_result.metrics.get(
                     "Отклонение реальной точки от диапазона, °C", np.nan
                 ),
-            },
-            {
-                "Модель": "Улучшенная",
-                "Прогноз для реальной точки, °C": improved_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
-                "Отклонение от диапазона 570–600 °C, °C": improved_result.metrics.get(
-                    "Отклонение реальной точки от диапазона, °C", np.nan
-                ),
-            },
-            {
-                "Модель": "Sigma-модель по зернам",
-                "Прогноз для реальной точки, °C": anchor_result.metrics.get("Прогноз для реальной точки, °C", np.nan),
-                "Отклонение от диапазона 570–600 °C, °C": anchor_result.metrics.get(
-                    "Отклонение реальной точки от диапазона, °C", np.nan
-                ),
-            },
-        ]
-    )
+            }
+        )
+    anchor_compare = pd.DataFrame(anchor_compare_rows)
     st.subheader("Проверка по важной реальной точке")
     st.dataframe(anchor_compare, use_container_width=True, hide_index=True)
 
 
-def show_multi_calculator(base_result: FitResult, improved_result: FitResult, anchor_result: FitResult) -> None:
+def show_multi_calculator(
+    base_result: FitResult,
+    improved_result: FitResult,
+    anchor_result: FitResult,
+    diameter_result: FitResult | None = None,
+) -> None:
     st.subheader("Калькулятор температуры по моделям")
     st.caption("Введите параметры структуры и наработки, затем нажмите кнопку расчета.")
 
@@ -2234,27 +2303,30 @@ def show_multi_calculator(base_result: FitResult, improved_result: FitResult, an
     base_params = base_result.params.set_index("Параметр модели")["Значение"].to_dict()
     improved_params = improved_result.params.set_index("Параметр модели")["Значение"].to_dict()
     anchor_params = anchor_result.params.set_index("Параметр модели")["Значение"].to_dict()
+    diameter_params = None
+    if diameter_result is not None:
+        diameter_params = diameter_result.params.set_index("Параметр модели")["Значение"].to_dict()
 
     try:
         base_temp = predict_temperature_engineering(base_params, d_value, tau_value, sigma_value, grain_value)
         improved_temp = predict_temperature_improved(improved_params, d_value, tau_value, sigma_value, grain_value)
         anchor_temp = predict_temperature_anchor_saturation(anchor_params, d_value, tau_value, sigma_value, grain_value)
 
-        r1, r2, r3 = st.columns(3)
-        with r1:
-            st.metric("Температура по базовой модели, °C", f"{base_temp:.4f}")
-        with r2:
-            st.metric("Температура по улучшенной модели, °C", f"{improved_temp:.4f}")
-        with r3:
-            st.metric("Температура по sigma-модели по зернам, °C", f"{anchor_temp:.4f}")
+        calc_rows = [
+            {"Модель": "Базовая", "Расчетная температура, °C": base_temp},
+            {"Модель": "Улучшенная", "Расчетная температура, °C": improved_temp},
+            {"Модель": "Sigma-модель по зернам", "Расчетная температура, °C": anchor_temp},
+        ]
+        if diameter_params is not None:
+            diameter_temp = predict_temperature_diameter_grain_model(diameter_params, d_value, tau_value, grain_value)
+            calc_rows.append({"Модель": "Модель роста диаметра", "Расчетная температура, °C": diameter_temp})
 
-        calc_df = pd.DataFrame(
-            [
-                {"Модель": "Базовая", "Расчетная температура, °C": base_temp},
-                {"Модель": "Улучшенная", "Расчетная температура, °C": improved_temp},
-                {"Модель": "Sigma-модель по зернам", "Расчетная температура, °C": anchor_temp},
-            ]
-        )
+        metric_columns = st.columns(len(calc_rows))
+        for col, row in zip(metric_columns, calc_rows):
+            with col:
+                st.metric(f"Температура: {row['Модель']}, °C", f"{row['Расчетная температура, °C']:.4f}")
+
+        calc_df = pd.DataFrame(calc_rows)
         st.dataframe(calc_df, use_container_width=True, hide_index=True)
     except Exception as exc:
         st.error(f"Не удалось выполнить расчет: {exc}")
@@ -2348,6 +2420,13 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
     except Exception as exc:
         sigma_error_local = str(exc)
 
+    sigma_formula_eval = None
+    sigma_formula_error = None
+    try:
+        sigma_formula_eval = evaluate_sigma_formula_model(prepared_df)
+    except Exception as exc:
+        sigma_formula_error = str(exc)
+
     quality_rows = []
     if diameter_payload is not None:
         quality_rows.append(
@@ -2373,11 +2452,23 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                 "Количество точек": selected_sigma_variant["eval"]["Количество точек"],
             }
         )
+    if sigma_formula_eval is not None:
+        quality_rows.append(
+            {
+                "Модель": "Температура по sigma-фазе",
+                "Версия": "T = G26 · (cσ / √τ)^0.192",
+                "R² по T": sigma_formula_eval["R² по T"],
+                "RMSE по T, °C": sigma_formula_eval["RMSE по T, °C"],
+                "MAE по T, °C": sigma_formula_eval["MAE по T, °C"],
+                "MAPE по T, %": sigma_formula_eval["MAPE по T, %"],
+                "Количество точек": sigma_formula_eval["Количество точек"],
+            }
+        )
     if quality_rows:
         st.subheader("Сравнение качества универсальных моделей")
         st.dataframe(pd.DataFrame(quality_rows), use_container_width=True, hide_index=True)
 
-    col_left, col_right = st.columns(2)
+    col_left, col_mid, col_right = st.columns(3)
     with col_left:
         st.subheader("Формула универсальной модели диаметра")
         if diameter_payload is None:
@@ -2398,7 +2489,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
             with st.expander("Сводка по универсальной модели диаметра"):
                 st.text(diameter_payload["summary"])
 
-    with col_right:
+    with col_mid:
         st.subheader("Формула универсальной sigma-модели")
         if selected_sigma_variant is None:
             st.error(f"Sigma-модель недоступна: {sigma_error_local}")
@@ -2417,6 +2508,26 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
             )
             with st.expander("Сводка по выбранной универсальной sigma-модели"):
                 st.text(selected_sigma_variant["summary"])
+
+    with col_right:
+        st.subheader("Формула температуры по sigma-фазе")
+        if sigma_formula_eval is None:
+            st.error(f"Формула температуры по sigma-фазе недоступна: {sigma_formula_error}")
+        else:
+            st.code(
+                "\n".join(
+                    [
+                        "T = G26 · (cσ / √τ)^0.192",
+                        "G26 = -4·G² - 36.848·G + 1941.6",
+                        "G = 3, 4, 5, 6, 7, 8, 9, 10",
+                    ]
+                ),
+                language="text",
+            )
+            st.caption(
+                f"Оценка на всех доступных загруженных точках: R²={sigma_formula_eval['R² по T']:.4f}, "
+                f"RMSE={sigma_formula_eval['RMSE по T, °C']:.4f} °C, точек={int(sigma_formula_eval['Количество точек'])}."
+            )
 
     st.subheader("Калькулятор по универсальным моделям")
     st.caption("Можно ввести диаметр, процент σ-фазы или оба параметра сразу. Расчет запускается только по кнопке.")
@@ -2469,16 +2580,23 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
                         "Интерпретация": f"{temp_sigma:.4f}",
                     }
                 )
+                temp_sigma_formula = predict_temperature_sigma_formula(float(grain_number), round(sigma_value, 2), tau_value)
+                result_rows.append(
+                    {
+                        "Модель": "Температура по sigma-фазе",
+                        "Расчетная температура, °C": temp_sigma_formula,
+                        "Интерпретация": f"{temp_sigma_formula:.4f}",
+                    }
+                )
 
             if len(result_rows) == 1:
                 row = result_rows[0]
                 st.success(f"{row['Модель']}: {row['Интерпретация']}")
             else:
-                c_res1, c_res2 = st.columns(2)
-                with c_res1:
-                    st.metric("Температура по универсальной модели диаметра, °C", result_rows[0]["Интерпретация"])
-                with c_res2:
-                    st.metric("Температура по универсальной sigma-модели, °C", result_rows[1]["Интерпретация"])
+                result_columns = st.columns(len(result_rows))
+                for col, row in zip(result_columns, result_rows):
+                    with col:
+                        st.metric(f"{row['Модель']}, °C", row["Интерпретация"])
             st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
         except Exception as exc:
             st.error(f"Не удалось выполнить расчет: {exc}")
@@ -2672,7 +2790,7 @@ if base_result is not None:
 if improved_result is not None:
     enrich_real_point_metrics(improved_result, predict_temperature_improved)
 if diameter_result is not None:
-    enrich_real_point_metrics(diameter_result, lambda params, D, tau, c_sigma, G: predict_temperature_diameter_growth(params, D, tau))
+    enrich_real_point_metrics(diameter_result, lambda params, D, tau, c_sigma, G: predict_temperature_diameter_grain_model(params, D, tau, G))
 if anchor_result is not None:
     enrich_real_point_metrics(anchor_result, predict_temperature_anchor_saturation)
 
@@ -3149,7 +3267,7 @@ with compare_tab:
     elif anchor_result is None:
         st.error(f"Sigma-модель по отдельным зернам недоступна для сравнения: {anchor_error}")
     else:
-        show_model_comparison(base_result, improved_result, anchor_result)
+        show_model_comparison(base_result, improved_result, anchor_result, diameter_result)
 
         grain_compare_rows: list[dict[str, float]] = []
         for grain in valid_grains:
@@ -3188,7 +3306,7 @@ with calculator_tab:
     elif anchor_result is None:
         st.error(f"Калькулятор sigma-модели по отдельным зернам недоступен: {anchor_error}")
     else:
-        show_multi_calculator(base_result, improved_result, anchor_result)
+        show_multi_calculator(base_result, improved_result, anchor_result, diameter_result)
 
 with universal_models_tab:
     render_universal_models_tab(prepared_df, valid_grains)
