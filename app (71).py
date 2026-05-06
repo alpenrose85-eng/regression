@@ -2686,10 +2686,6 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
             "T_assumed": "Предполагаемая температура, °C",
         }
     )
-    if "Точка" in display_df.columns:
-        point_numeric = pd.to_numeric(display_df["Точка"], errors="coerce")
-        point_mask = point_numeric.notna()
-        display_df.loc[point_mask, "Точка"] = point_numeric[point_mask].round(0).astype("Int64").astype(str)
     integer_round_columns = [
         "Время, ч",
         "Номер зерна",
@@ -2707,14 +2703,29 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         "Диаметр sigma",
         "Sigma-фаза, %",
     ]
+
+    def format_int_like(value: object) -> str:
+        if not is_finite_number(value):
+            return ""
+        return str(int(round(float(value))))
+
+    def format_up_to_2_decimals(value: object) -> str:
+        if not is_finite_number(value):
+            return ""
+        return f"{float(value):.2f}".rstrip("0").rstrip(".")
+
+    calibration_formatters: dict[str, object] = {}
+    if "Точка" in display_df.columns:
+        calibration_formatters["Точка"] = lambda value: format_int_like(value) if is_finite_number(value) else str(value)
     for col in integer_round_columns:
         if col in display_df.columns:
-            display_df[col] = display_df[col].round(0).astype("Int64")
+            calibration_formatters[col] = format_int_like
     for col in decimal_round_columns:
         if col in display_df.columns:
-            display_df[col] = display_df[col].round(2)
+            calibration_formatters[col] = format_up_to_2_decimals
+
     st.dataframe(
-        display_df.style.apply(highlight_calibration_row, axis=1),
+        display_df.style.apply(highlight_calibration_row, axis=1).format(calibration_formatters),
         use_container_width=True,
         hide_index=True,
     )
