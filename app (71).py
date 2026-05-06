@@ -2618,14 +2618,7 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
             "Δ sigma по зерну, °C",
             "Δ рост диаметра, °C",
         ]
-        abs_columns_local = [
-            "|Δ| базовая, °C",
-            "|Δ| улучшенная, °C",
-            "|Δ| sigma по зерну, °C",
-            "|Δ| рост диаметра, °C",
-        ]
-
-        finite_errors = {col: row[col] for col in abs_columns_local if is_finite_number(row[col])}
+        finite_errors = {col: abs(float(row[col])) for col in delta_columns_local if col in row.index and is_finite_number(row[col])}
         best_error = min(finite_errors.values()) if finite_errors else None
         worst_error = max(finite_errors.values()) if finite_errors else None
 
@@ -2639,14 +2632,14 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
                         styles[idx] = "background-color: #e8f5e9; color: #1b5e20; font-weight: 600;"
                     elif abs(value) >= 30:
                         styles[idx] = "background-color: #ffebee; color: #b71c1c; font-weight: 600;"
-            if col in abs_columns_local and best_error is not None and worst_error is not None:
-                value = row[col]
-                if not is_finite_number(value):
-                    styles[idx] = "background-color: #eeeeee; color: #757575;"
-                elif value == best_error:
-                    styles[idx] = "background-color: #c8e6c9; color: #1b5e20; font-weight: 700;"
-                elif value == worst_error:
-                    styles[idx] = "background-color: #ffcdd2; color: #b71c1c; font-weight: 700;"
+                if best_error is not None and worst_error is not None:
+                    abs_value = abs(float(value))
+                    if abs_value == best_error:
+                        styles[idx] = "background-color: #c8e6c9; color: #1b5e20; font-weight: 700;"
+                    elif abs_value == worst_error:
+                        styles[idx] = "background-color: #ffcdd2; color: #b71c1c; font-weight: 700;"
+            if col in temp_columns and not is_finite_number(row.get(col)):
+                styles[idx] = "background-color: #eeeeee; color: #757575;"
             if col == "Лучшая модель по точке":
                 styles[idx] = "background-color: #fff3cd; color: #7a5d00; font-weight: 700;"
         return styles
