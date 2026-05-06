@@ -109,6 +109,13 @@ GRAIN_SIZE_MM = {
 }
 
 SIGMA_UNIVERSAL_GRAINS = [3.0, 5.0, 8.0, 9.0, 10.0]
+PHYSICAL_TEMP_MIN_C = 550.0
+PHYSICAL_TEMP_MAX_C = 900.0
+
+
+def diameter_temperature_factor(temp_c: float | np.ndarray) -> float | np.ndarray:
+    temp_norm = (np.asarray(temp_c, dtype=float) - PHYSICAL_TEMP_MIN_C) / (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C)
+    return np.log(np.clip(temp_norm, 1e-9, None))
 
 SCIENTIFIC_UNIVERSAL_SIGMA_PARAGRAPH = (
     "Универсализированная модель содержания σ-фазы по размеру зерна строится по наиболее надежной части "
@@ -663,31 +670,37 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
             weak_points=weak_points,
             model_summary="Модели роста диаметра по отдельным зернам.\n\n" + "\n\n".join(summary_parts),
             outlier_recommendation=outlier_recommendation,
-            formula_text="Для каждого номера зерна отдельно: ln(D)=a_G+b_G·ln(τ)+c_G·(1/T(K))",
-            model_label="Эмпирические модели роста диаметра по отдельным зернам",
+            formula_text=(
+                "Для каждого номера зерна отдельно: ln(D)=a_G+b_G·ln(τ)+c_G·ln((T-550)/350)\n"
+                "Нижняя физическая граница 550 °C заложена внутрь самой температурной переменной."
+            ),
+            model_label="Эмпирические модели роста диаметра по отдельным зернам с температурным порогом 550 °C",
         )
 
-    feature_columns = ["ln_tau", "inv_T"]
-    X = sm.add_constant(df[feature_columns])
+    work_df = df.copy()
+    work_df["ln_temp_factor"] = diameter_temperature_factor(work_df["T"])
+
+    feature_columns = ["ln_tau", "ln_temp_factor"]
+    X = sm.add_constant(work_df[feature_columns])
     y = df["ln_D"]
 
     model = sm.OLS(y, X).fit()
     influence = model.get_influence()
 
-    a2 = model.params.get("inv_T", np.nan)
+    a2 = model.params.get("ln_temp_factor", np.nan)
     if not np.isfinite(a2) or abs(a2) < 1e-12:
-        raise ValueError("Коэффициент при 1/T в модели роста диаметра слишком мал для устойчивого обратного расчета.")
+        raise ValueError("Коэффициент при температурном факторе в модели роста диаметра слишком мал для устойчивого обратного расчета.")
 
     numerator = df["ln_D"] - model.params.get("const", 0.0) - model.params.get("ln_tau", 0.0) * df["ln_tau"]
-    inv_t_pred = numerator / a2
-    if np.any(inv_t_pred <= 0):
-        raise ValueError("Модель роста диаметра дала неположительное значение 1/T для части точек.")
-
-    temp_kelvin_pred = 1.0 / inv_t_pred
-    temp_c_pred = temp_kelvin_pred - 273.15
+    ln_temp_factor_pred = numerator / a2
+    temp_c_pred = np.clip(
+        PHYSICAL_TEMP_MIN_C + (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C) * np.exp(ln_temp_factor_pred),
+        PHYSICAL_TEMP_MIN_C,
+        PHYSICAL_TEMP_MAX_C,
+    )
 
     result_df = df.copy()
-    result_df["inv_T_pred"] = inv_t_pred
+    result_df["ln_temp_factor_pred"] = ln_temp_factor_pred
     result_df["T_pred"] = temp_c_pred
     result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
     result_df["abs_error"] = np.abs(result_df["error_celsius"])
@@ -709,23 +722,23 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
     params = pd.DataFrame(
         {
             "Коэффициент": ["a", "b", "c"],
-            "Параметр модели": ["const", "ln_tau", "inv_T"],
-            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get("inv_T", np.nan)],
-            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get("inv_T", np.nan)],
-            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get("inv_T", np.nan)],
-            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get("inv_T", np.nan)],
-            "Нижняя 95% граница": [conf_int.loc["const", 0], conf_int.loc["ln_tau", 0], conf_int.loc["inv_T", 0]],
-            "Верхняя 95% граница": [conf_int.loc["const", 1], conf_int.loc["ln_tau", 1], conf_int.loc["inv_T", 1]],
+            "Параметр модели": ["const", "ln_tau", "ln_temp_factor"],
+            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get("ln_temp_factor", np.nan)],
+            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get("ln_temp_factor", np.nan)],
+            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get("ln_temp_factor", np.nan)],
+            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get("ln_temp_factor", np.nan)],
+            "Нижняя 95% граница": [conf_int.loc["const", 0], conf_int.loc["ln_tau", 0], conf_int.loc["ln_temp_factor", 0]],
+            "Верхняя 95% граница": [conf_int.loc["const", 1], conf_int.loc["ln_tau", 1], conf_int.loc["ln_temp_factor", 1]],
         }
     )
 
     metrics = build_metrics(result_df, predictor_count=len(feature_columns))
     formula_text = (
-        "ln(D) = a + b·ln(τ) + c·(1/T(K))\n"
+        "ln(D) = a + b·ln(τ) + c·ln((T - 550) / 350)\n"
         f"a = {model.params.get('const', np.nan):.8f}\n"
         f"b = {model.params.get('ln_tau', np.nan):.8f}\n"
-        f"c = {model.params.get('inv_T', np.nan):.8f}\n"
-        f"Итог: ln(D) = {model.params.get('const', np.nan):.8f} + ({model.params.get('ln_tau', np.nan):.8f})·ln(τ) + ({model.params.get('inv_T', np.nan):.8f})·(1/T(K))"
+        f"c = {model.params.get('ln_temp_factor', np.nan):.8f}\n"
+        f"Итог: ln(D) = {model.params.get('const', np.nan):.8f} + ({model.params.get('ln_tau', np.nan):.8f})·ln(τ) + ({model.params.get('ln_temp_factor', np.nan):.8f})·ln((T - 550) / 350)"
     )
 
     return FitResult(
@@ -736,7 +749,7 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
         model_summary=model.summary().as_text(),
         outlier_recommendation=outlier_recommendation,
         formula_text=formula_text,
-        model_label="Эмпирическая модель роста диаметра ln(D)=a+b·ln(τ)+c·(1/T)",
+        model_label="Эмпирическая модель роста диаметра ln(D)=a+b·ln(τ)+c·ln((T-550)/350)",
     )
 
 
@@ -776,7 +789,7 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         log_a, p_exp, m_exp = params_vec
         denom = np.exp(log_a) * np.power(np.maximum(tau_vals, 1e-12), p_exp)
         temp_norm_pred = np.power(np.maximum(sigma_true / np.maximum(denom, 1e-12), 1e-12), 1.0 / m_exp)
-        temp_pred = np.clip(550.0 + 350.0 * temp_norm_pred, 550.0, 900.0)
+        temp_pred = np.clip(PHYSICAL_TEMP_MIN_C + 350.0 * temp_norm_pred, PHYSICAL_TEMP_MIN_C, PHYSICAL_TEMP_MAX_C)
         return params_vec, sigma_pred, temp_pred
 
     def solve_temp_from_model(params: dict[str, float], tau_value: float, sigma_value: float) -> float:
@@ -789,7 +802,7 @@ def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) ->
         if not np.isfinite(denom) or denom <= 0 or not np.isfinite(m_exp) or abs(m_exp) < 1e-12:
             raise ValueError("Степенная sigma-модель дала некорректные параметры.")
         temp_norm = np.power(max(sigma_value / denom, 1e-12), 1.0 / m_exp)
-        return float(np.clip(550.0 + 350.0 * temp_norm, 550.0, 900.0))
+        return float(np.clip(PHYSICAL_TEMP_MIN_C + 350.0 * temp_norm, PHYSICAL_TEMP_MIN_C, PHYSICAL_TEMP_MAX_C))
 
     if include_grain:
         result_frames: list[pd.DataFrame] = []
@@ -1247,19 +1260,23 @@ def predict_temperature_improved(params: dict[str, float], D: float, tau: float,
 
 
 def predict_temperature_diameter_growth(params: dict[str, float], D: float, tau: float) -> float:
-    a2 = params.get("inv_T", np.nan)
+    a2 = params.get("ln_temp_factor", np.nan)
     if not np.isfinite(a2) or abs(a2) < 1e-12:
-        raise ValueError("В модели роста диаметра коэффициент при 1/T слишком мал для устойчивого расчета.")
-    inv_t = (np.log(D) - params.get("const", 0.0) - params.get("ln_tau", 0.0) * np.log(tau)) / a2
-    if inv_t <= 0:
-        raise ValueError("Модель роста диаметра дала неположительное значение 1/T.")
-    return 1.0 / inv_t - 273.15
+        raise ValueError("В модели роста диаметра коэффициент при температурном факторе слишком мал для устойчивого расчета.")
+    ln_temp_factor = (np.log(D) - params.get("const", 0.0) - params.get("ln_tau", 0.0) * np.log(tau)) / a2
+    return float(
+        np.clip(
+            PHYSICAL_TEMP_MIN_C + (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C) * np.exp(ln_temp_factor),
+            PHYSICAL_TEMP_MIN_C,
+            PHYSICAL_TEMP_MAX_C,
+        )
+    )
 
 
 def predict_temperature_diameter_grain_model(
     params: dict[str, float], D: float, tau: float, G: float | None = None
 ) -> float:
-    if all(key in params for key in ["const", "ln_tau", "inv_T"]):
+    if all(key in params for key in ["const", "ln_tau", "ln_temp_factor"]):
         grain_params = params
     else:
         if G is None:
@@ -1365,7 +1382,7 @@ def fit_diameter_universal_grain_size_model(
                 "ln_grain_size": float(np.log(grain_size)),
                 "a": float(params.get("const", np.nan)),
                 "b": float(params.get("ln_tau", np.nan)),
-                "c": float(params.get("inv_T", np.nan)),
+                "c": float(params.get("ln_temp_factor", np.nan)),
                 "R²": float(result.metrics.get("R²", np.nan)),
             }
         )
@@ -1405,7 +1422,8 @@ def fit_diameter_universal_grain_size_model(
         f"a(dg)=alpha0+alpha1·ln(dg)+alpha2·[ln(dg)]², R²={model_a.rsquared:.4f}\n"
         f"b(dg)=beta0+beta1·ln(dg)+beta2·[ln(dg)]², R²={model_b.rsquared:.4f}\n"
         f"c(dg)=gamma0+gamma1·ln(dg)+gamma2·[ln(dg)]², R²={model_c.rsquared:.4f}\n"
-        f"Использованы все зерна: {included_grains}"
+        f"Использованы все зерна: {included_grains}\n"
+        "Итоговая форма: ln(D)=a(dg)+b(dg)·ln(τ)+c(dg)·ln((T-550)/350)"
     )
     return params, coeff_df, summary_text
 
@@ -1556,11 +1574,15 @@ def predict_temperature_diameter_universal(params: dict[str, float], D: float, t
         b_val = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
     c_val = params["gamma0"] + params["gamma1"] * ln_g + params["gamma2"] * (ln_g ** 2)
     if not np.isfinite(c_val) or abs(c_val) < 1e-12:
-        raise ValueError("Универсальная модель дала слишком малый коэффициент при 1/T.")
-    inv_t = (np.log(D) - a_val - b_val * np.log(tau)) / c_val
-    if not np.isfinite(inv_t) or inv_t <= 0:
-        raise ValueError("Универсальная модель дала неположительное значение 1/T.")
-    return float(1.0 / inv_t - 273.15)
+        raise ValueError("Универсальная модель дала слишком малый коэффициент при температурном факторе.")
+    ln_temp_factor = (np.log(D) - a_val - b_val * np.log(tau)) / c_val
+    return float(
+        np.clip(
+            PHYSICAL_TEMP_MIN_C + (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C) * np.exp(ln_temp_factor),
+            PHYSICAL_TEMP_MIN_C,
+            PHYSICAL_TEMP_MAX_C,
+        )
+    )
 
 
 def predict_temperature_sigma_universal(params: dict[str, float], tau: float, c_sigma: float, grain_size_mm: float) -> float:
@@ -1962,7 +1984,7 @@ def build_diameter_grain_report(cleaned_diameter_results: dict[float, FitResult]
                 "Количество точек": float(result.metrics.get("Количество точек", len(result.data))),
                 "a": float(params.get("const", np.nan)),
                 "b": float(params.get("ln_tau", np.nan)),
-                "c": float(params.get("inv_T", np.nan)),
+                "c": float(params.get("ln_temp_factor", np.nan)),
                 "R² по T": float(result.metrics.get("R²", np.nan)),
                 "RMSE по T, °C": float(result.metrics.get("RMSE, °C", np.nan)),
                 "MAE по T, °C": float(result.metrics.get("MAE, °C", np.nan)),
@@ -2141,7 +2163,7 @@ def render_report_data_tab(prepared_df: pd.DataFrame, valid_grains: list[float])
     diameter_universal_df = pd.DataFrame(
         [
             {
-                "Формула": "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))",
+                "Формула": "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·ln((T - 550) / 350)",
                 "alpha0": float(diameter_params["alpha0"]),
                 "alpha1": float(diameter_params["alpha1"]),
                 "alpha2": float(diameter_params["alpha2"]),
@@ -2291,8 +2313,8 @@ def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
         try:
             temp_value = predict_temperature_diameter_growth(calc_params, d_value, tau_value)
             st.metric("Расчетная температура по модели диаметра, °C", format_temperature_interpretation(temp_value))
-            if temp_value < 550.0:
-                st.caption("Значение ниже 550 °C показывается как вне физически обоснованной области, но сама формула модели не меняется.")
+            if temp_value <= PHYSICAL_TEMP_MIN_C:
+                st.caption("В модели роста диаметра температурный фактор задан через ln((T - 550) / 350), поэтому порог 550 °C встроен в саму формулу.")
         except Exception as exc:
             st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
 
@@ -2983,7 +3005,7 @@ def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[fl
             st.code(
                 "\n".join(
                     [
-                        "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))",
+                        "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·ln((T - 550) / 350)",
                         f"a(dg) = {fmt_trimmed(p['alpha0'], 4)} + ({fmt_trimmed(p['alpha1'], 4)}) · ln(dg) + ({fmt_trimmed(p['alpha2'], 4)}) · [ln(dg)]²",
                         f"b(dg) = {fmt_trimmed(p['beta0'], 4)} + ({fmt_trimmed(p['beta1'], 4)}) · ln(dg) + ({fmt_trimmed(p['beta2'], 4)}) · [ln(dg)]²",
                         f"c(dg) = {fmt_trimmed(p['gamma0'], 4)} + ({fmt_trimmed(p['gamma1'], 4)}) · ln(dg) + ({fmt_trimmed(p['gamma2'], 4)}) · [ln(dg)]²",
@@ -3646,7 +3668,7 @@ with diameter_tab:
                 )
                 st.dataframe(meta_quality_df, use_container_width=True, hide_index=True)
                 formula_text = (
-                    "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))\n"
+                    "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·ln((T - 550) / 350)\n"
                     "a(dg) = alpha0 + alpha1·ln(dg) + alpha2·[ln(dg)]²\n"
                     "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²\n"
                     "c(dg) = gamma0 + gamma1·ln(dg) + gamma2·[ln(dg)]²\n"
@@ -3673,8 +3695,8 @@ with diameter_tab:
                     try:
                         temp_value = predict_temperature_diameter_universal(universal_params, d_value, tau_value, GRAIN_SIZE_MM[float(grain_number)])
                         st.metric("Расчетная температура по универсальной модели, °C", format_temperature_interpretation(temp_value))
-                        if temp_value < 550.0:
-                            st.caption("Если расчет ниже 550 °C, результат показывается как вне физически обоснованной области без изменения самой формулы модели.")
+                        if temp_value <= PHYSICAL_TEMP_MIN_C:
+                            st.caption("В универсальной модели диаметра порог 550 °C встроен в температурный фактор ln((T - 550) / 350).")
                     except Exception as exc:
                         st.error(f"Не удалось выполнить расчет по универсальной модели: {exc}")
             except Exception as exc:
