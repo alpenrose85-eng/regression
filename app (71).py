@@ -3928,12 +3928,43 @@ with diameter_tab:
             )
 
         with compare_variants_tab:
-            compare_rows = []
+            st.write(
+                "Ниже сравнение разделено на два уровня: сначала локальные зерновые модели, затем универсальные модели. "
+                "Универсальные варианты 2 и 3 собираются по уже очищенным локальным моделям, с учетом исключенных точек."
+            )
             cleaned_variants = {
                 "Исходная": build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_diameter_growth_model, "diameter_grain"),
                 "Альтернатива 2": build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_diameter_growth_model_alt2, "diameter_alt2_grain"),
                 "Альтернатива 3": build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_diameter_growth_model_alt3, "diameter_alt3_grain"),
             }
+
+            st.subheader("1. Сравнение локальных моделей по одному выбранному зерну")
+            selected_compare_grain = st.selectbox(
+                "Номер зерна для прямого сравнения трех локальных вариантов",
+                valid_grains,
+                key="compare_diameter_variants_grain",
+            )
+            selected_grain_rows = []
+            for label, results_dict in cleaned_variants.items():
+                result = results_dict.get(selected_compare_grain)
+                if result is None:
+                    continue
+                selected_grain_rows.append(
+                    {
+                        "Вариант": label,
+                        "Номер зерна": selected_compare_grain,
+                        "Количество точек": result.metrics["Количество точек"],
+                        "R²": result.metrics["R²"],
+                        "RMSE, °C": result.metrics["RMSE, °C"],
+                        "MAE, °C": result.metrics["MAE, °C"],
+                        "MAPE, %": result.metrics["MAPE, %"],
+                    }
+                )
+            if selected_grain_rows:
+                st.dataframe(pd.DataFrame(selected_grain_rows), use_container_width=True, hide_index=True)
+
+            compare_rows = []
+            local_summary_rows = []
             for grain in valid_grains:
                 row = {"Номер зерна": grain}
                 has_data = False
@@ -3944,11 +3975,40 @@ with diameter_tab:
                     has_data = True
                     row[f"R² {label}"] = result.metrics["R²"]
                     row[f"RMSE {label}, °C"] = result.metrics["RMSE, °C"]
+                    row[f"MAE {label}, °C"] = result.metrics["MAE, °C"]
                     row[f"MAPE {label}, %"] = result.metrics["MAPE, %"]
                 if has_data:
                     compare_rows.append(row)
+            for label, results_dict in cleaned_variants.items():
+                rows = []
+                for grain, result in results_dict.items():
+                    rows.append(
+                        {
+                            "Номер зерна": grain,
+                            "Количество точек": result.metrics["Количество точек"],
+                            "R²": result.metrics["R²"],
+                            "RMSE, °C": result.metrics["RMSE, °C"],
+                            "MAE, °C": result.metrics["MAE, °C"],
+                            "MAPE, %": result.metrics["MAPE, %"],
+                        }
+                    )
+                if rows:
+                    variant_df = pd.DataFrame(rows)
+                    local_summary_rows.append(
+                        {
+                            "Вариант": label,
+                            "Количество зерновых моделей": float(len(variant_df)),
+                            "Средний R²": float(variant_df["R²"].mean()),
+                            "Средний RMSE, °C": float(variant_df["RMSE, °C"].mean()),
+                            "Средний MAE, °C": float(variant_df["MAE, °C"].mean()),
+                            "Средний MAPE, %": float(variant_df["MAPE, %"].mean()),
+                        }
+                    )
+            if local_summary_rows:
+                st.subheader("2. Сводка по локальным зерновым моделям")
+                st.dataframe(pd.DataFrame(local_summary_rows), use_container_width=True, hide_index=True)
             if compare_rows:
-                st.subheader("Сравнение трех вариантов по номерам зерна")
+                st.subheader("3. Таблица локальных метрик по всем зернам")
                 st.dataframe(pd.DataFrame(compare_rows), use_container_width=True, hide_index=True)
 
             try:
@@ -3958,7 +4018,8 @@ with diameter_tab:
                 e1 = evaluate_diameter_universal_model(p1, cleaned_variants["Исходная"])
                 e2 = evaluate_diameter_universal_model_alt2(p2, cleaned_variants["Альтернатива 2"])
                 e3 = evaluate_diameter_universal_model_alt3(p3, cleaned_variants["Альтернатива 3"])
-                st.subheader("Сравнение универсальных версий")
+                st.subheader("4. Сравнение универсальных моделей")
+                st.caption("Это уже не локальные модели по одному зерну, а универсальные зависимости, собранные по очищенным зерновым моделям каждого варианта.")
                 st.dataframe(
                     pd.DataFrame([
                         {"Вариант": "Исходная", **e1},
