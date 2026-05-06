@@ -2683,13 +2683,13 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
             "D": "Диаметр sigma",
             "G": "Номер зерна",
             "c_sigma": "Sigma-фаза, %",
-            "T_assumed": "Предполагаемая температура, °C",
+            "T_assumed": "Предп. температура, °C",
         }
     )
     integer_round_columns = [
         "Время, ч",
         "Номер зерна",
-        "Предполагаемая температура, °C",
+        "Предп. температура, °C",
         "T_общая модель, °C",
         "Δ общая модель, °C",
         "T_рост диаметра, °C",
@@ -2724,10 +2724,51 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         if col in display_df.columns:
             calibration_formatters[col] = format_up_to_2_decimals
 
+    st.markdown(
+        """
+        <style>
+        [data-testid="stDataFrame"] table {
+            table-layout: fixed;
+            width: 100%;
+        }
+        [data-testid="stDataFrame"] th {
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+            line-height: 1.1 !important;
+        }
+        [data-testid="stDataFrame"] th div {
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+            line-height: 1.1 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.dataframe(
         display_df.style.apply(highlight_calibration_row, axis=1).format(calibration_formatters),
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Точка": st.column_config.TextColumn(width="small"),
+            "Время, ч": st.column_config.TextColumn(width="small"),
+            "Диаметр sigma": st.column_config.TextColumn(width="small"),
+            "Номер зерна": st.column_config.TextColumn(width="small"),
+            "Sigma-фаза, %": st.column_config.TextColumn(width="small"),
+            "Предп. температура, °C": st.column_config.TextColumn(width="small"),
+            "T_общая модель, °C": st.column_config.TextColumn(width="small"),
+            "Δ общая модель, °C": st.column_config.TextColumn(width="small"),
+            "T_рост диаметра, °C": st.column_config.TextColumn(width="small"),
+            "Δ рост диаметра, °C": st.column_config.TextColumn(width="small"),
+            "T_sigma универсальная, °C": st.column_config.TextColumn(width="small"),
+            "Δ sigma универсальная, °C": st.column_config.TextColumn(width="small"),
+            "T_вторая по проценту, °C": st.column_config.TextColumn(width="small"),
+            "Δ вторая по проценту, °C": st.column_config.TextColumn(width="small"),
+            "Лучшая модель по точке": st.column_config.TextColumn(width="medium"),
+        },
     )
     st.caption("Зелёным подсвечены лучшие/близкие значения, красным — наибольшие отклонения по строке.")
 
