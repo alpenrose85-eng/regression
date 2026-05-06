@@ -2500,17 +2500,32 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     try:
         calibration_raw_df = load_file(calibration_file)
         calibration_df = prepare_calibration_dataframe(calibration_raw_df)
-        anchor_calibration_result = fit_anchor_saturation_model(prepared_df, include_grain=True)
-        diameter_calibration_result = fit_diameter_growth_model(prepared_df, include_grain=True)
+        valid_grains = []
+        for grain in sorted(prepared_df["G"].dropna().unique().tolist()):
+            grain_df = prepared_df[prepared_df["G"] == grain].copy()
+            if len(grain_df) >= 7:
+                valid_grains.append(grain)
+
+        cleaned_sigma_results = build_cleaned_sigma_grain_results(prepared_df, valid_grains)
+        cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
+
+        sigma_universal_params_raw, _, _ = fit_sigma_universal_grain_size_model(
+            cleaned_sigma_results,
+            variant="median_constants",
+        )
+        diameter_universal_params_raw, _, _ = fit_diameter_universal_grain_size_model(
+            cleaned_diameter_results,
+            variant="quadratic_full",
+        )
+
+        sigma_universal_params = sigma_universal_params_raw
+        diameter_universal_params = get_final_diameter_params(diameter_universal_params_raw)
     except Exception as exc:
         st.error(f"Не удалось выполнить калибровку: {exc}")
         return
 
     with st.expander("Предпросмотр исходного файла калибровки"):
         st.dataframe(calibration_raw_df, use_container_width=True)
-
-    anchor_params = anchor_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
-    diameter_params = diameter_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
 
     def safe_apply(frame: pd.DataFrame, predictor, *columns: str) -> pd.Series:
         values: list[float] = []
@@ -2523,16 +2538,15 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         return pd.Series(values, index=frame.index, dtype=float)
 
     result_df = calibration_df.copy()
-    result_df["T_sigma по зерну, °C"] = safe_apply(
+    result_df["T_sigma универсальная, °C"] = safe_apply(
         result_df,
-        lambda D, tau, G, c_sigma: predict_temperature_anchor_saturation(anchor_params, D, tau, c_sigma, G),
-        "D",
+        lambda tau, G, c_sigma: predict_temperature_sigma_universal(sigma_universal_params, tau, c_sigma, GRAIN_SIZE_MM[float(G)]),
         "tau",
         "G",
         "c_sigma",
     )
-    result_df["Δ sigma по зерну, °C"] = result_df["T_sigma по зерну, °C"] - result_df["T_assumed"]
-    result_df["|Δ| sigma по зерну, °C"] = result_df["Δ sigma по зерну, °C"].abs()
+    result_df["Δ sigma универсальная, °C"] = result_df["T_sigma универсальная, °C"] - result_df["T_assumed"]
+    result_df["|Δ| sigma универсальная, °C"] = result_df["Δ sigma универсальная, °C"].abs()
 
     result_df["T_вторая по проценту, °C"] = safe_apply(
         result_df,
@@ -2546,7 +2560,7 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
 
     result_df["T_рост диаметра, °C"] = safe_apply(
         result_df,
-        lambda D, tau, G: predict_temperature_diameter_grain_model(diameter_params, D, tau, G),
+        lambda D, tau, G: predict_temperature_diameter_universal(diameter_universal_params, D, tau, GRAIN_SIZE_MM[float(G)]),
         "D",
         "tau",
         "G",
@@ -2555,13 +2569,13 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     result_df["|Δ| рост диаметра, °C"] = result_df["Δ рост диаметра, °C"].abs()
 
     abs_error_columns = {
-        "Модель роста диаметра": "|Δ| рост диаметра, °C",
-        "Sigma-модель по зерну": "|Δ| sigma по зерну, °C",
+        "Универсальная модель диаметра": "|Δ| рост диаметра, °C",
+        "Универсальная sigma-модель": "|Δ| sigma универсальная, °C",
         "Вторая модель по проценту": "|Δ| вторая по проценту, °C",
     }
     delta_columns = {
-        "Модель роста диаметра": "Δ рост диаметра, °C",
-        "Sigma-модель по зерну": "Δ sigma по зерну, °C",
+        "Универсальная модель диаметра": "Δ рост диаметра, °C",
+        "Универсальная sigma-модель": "Δ sigma универсальная, °C",
         "Вторая модель по проценту": "Δ вторая по проценту, °C",
     }
 
@@ -2574,8 +2588,8 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     result_df["Лучшая модель по точке"] = result_df.apply(choose_best_model, axis=1)
 
     unavailable_counts = {
-        "Модель роста диаметра": int(result_df["T_рост диаметра, °C"].isna().sum()),
-        "Sigma-модель по зерну": int(result_df["T_sigma по зерну, °C"].isna().sum()),
+        "Универсальная модель диаметра": int(result_df["T_рост диаметра, °C"].isna().sum()),
+        "Универсальная sigma-модель": int(result_df["T_sigma универсальная, °C"].isna().sum()),
         "Вторая модель по проценту": int(result_df["T_вторая по проценту, °C"].isna().sum()),
     }
     unavailable_total = sum(unavailable_counts.values())
@@ -2589,12 +2603,12 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         styles = [""] * len(row)
         temp_columns = [
             "T_рост диаметра, °C",
-            "T_sigma по зерну, °C",
+            "T_sigma универсальная, °C",
             "T_вторая по проценту, °C",
         ]
         delta_columns_local = [
             "Δ рост диаметра, °C",
-            "Δ sigma по зерну, °C",
+            "Δ sigma универсальная, °C",
             "Δ вторая по проценту, °C",
         ]
         finite_errors = {col: abs(float(row[col])) for col in delta_columns_local if col in row.index and is_finite_number(row[col])}
@@ -2635,8 +2649,8 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         "T_assumed",
         "T_рост диаметра, °C",
         "Δ рост диаметра, °C",
-        "T_sigma по зерну, °C",
-        "Δ sigma по зерну, °C",
+        "T_sigma универсальная, °C",
+        "Δ sigma универсальная, °C",
         "T_вторая по проценту, °C",
         "Δ вторая по проценту, °C",
         "Лучшая модель по точке",
@@ -2661,8 +2675,8 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         "Предполагаемая температура, °C",
         "T_рост диаметра, °C",
         "Δ рост диаметра, °C",
-        "T_sigma по зерну, °C",
-        "Δ sigma по зерну, °C",
+        "T_sigma универсальная, °C",
+        "Δ sigma универсальная, °C",
         "T_вторая по проценту, °C",
         "Δ вторая по проценту, °C",
     ]
