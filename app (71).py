@@ -117,6 +117,20 @@ def diameter_temperature_factor(temp_c: float | np.ndarray) -> float | np.ndarra
     temp_norm = (np.asarray(temp_c, dtype=float) - PHYSICAL_TEMP_MIN_C) / (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C)
     return np.log(np.clip(temp_norm, 1e-9, None))
 
+
+def diameter_temperature_factor_inverse(temp_feature: float | np.ndarray) -> float | np.ndarray:
+    return PHYSICAL_TEMP_MIN_C + (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C) * np.exp(np.asarray(temp_feature, dtype=float))
+
+
+def diameter_inverse_excess_temperature(temp_c: float | np.ndarray) -> float | np.ndarray:
+    effective_kelvin = np.asarray(temp_c, dtype=float) - PHYSICAL_TEMP_MIN_C + 273.15
+    return 1.0 / np.clip(effective_kelvin, 1e-9, None)
+
+
+def diameter_inverse_excess_temperature_inverse(temp_feature: float | np.ndarray) -> float | np.ndarray:
+    effective_kelvin = 1.0 / np.clip(np.asarray(temp_feature, dtype=float), 1e-12, None)
+    return PHYSICAL_TEMP_MIN_C - 273.15 + effective_kelvin
+
 SCIENTIFIC_UNIVERSAL_SIGMA_PARAGRAPH = (
     "Универсализированная модель содержания σ-фазы по размеру зерна строится по наиболее надежной части "
     "экспериментальной выборки, где содержание σ-фазы достаточно велико для устойчивого измерения и, "
@@ -599,23 +613,50 @@ def fit_improved_model(df: pd.DataFrame, include_grain: bool = True) -> FitResul
     )
 
 
-def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> FitResult:
+def fit_diameter_variant_model(df: pd.DataFrame, include_grain: bool, variant: str) -> FitResult:
     if len(df) < 7:
         raise ValueError("Для устойчивой подгонки нужно хотя бы 7 точек.")
+
+    variant_specs = {
+        "original": {
+            "param": "inv_T",
+            "feature_builder": lambda frame: frame["inv_T"],
+            "inverse_builder": lambda feature: 1.0 / feature - 273.15,
+            "formula": "ln(D) = a + b·ln(τ) + c·(1/T(K))",
+            "label": "Исходная модель роста диаметра",
+            "summary": "Исходная модель роста диаметра",
+        },
+        "alt2": {
+            "param": "ln_temp_factor",
+            "feature_builder": lambda frame: diameter_temperature_factor(frame["T"]),
+            "inverse_builder": diameter_temperature_factor_inverse,
+            "formula": "ln(D) = a + b·ln(τ) + c·ln((T - 550) / 350)",
+            "label": "Альтернативная модель диаметра: пороговая логарифмическая",
+            "summary": "Альтернативная пороговая модель диаметра",
+        },
+        "alt3": {
+            "param": "inv_T_excess",
+            "feature_builder": lambda frame: diameter_inverse_excess_temperature(frame["T"]),
+            "inverse_builder": diameter_inverse_excess_temperature_inverse,
+            "formula": "ln(D) = a + b·ln(τ) + c·(1 / (T - 550 + 273.15))",
+            "label": "Альтернативная модель диаметра: обратная температура превышения",
+            "summary": "Альтернативная модель диаметра с обратной температурой превышения порога",
+        },
+    }
+    spec = variant_specs[variant]
 
     if include_grain:
         result_frames: list[pd.DataFrame] = []
         param_rows: list[dict[str, float | str]] = []
         summary_parts: list[str] = []
-
         for grain_value in sorted(df["G"].dropna().unique().tolist()):
             grain_df = df[df["G"] == grain_value].copy()
             if len(grain_df) < 7:
                 summary_parts.append(f"Зерно {grain_value}: пропущено, точек меньше 7.")
                 continue
-            grain_result = fit_diameter_growth_model(grain_df, include_grain=False)
+            grain_result = fit_diameter_variant_model(grain_df, include_grain=False, variant=variant)
             result_frames.append(grain_result.data)
-            summary_parts.append(f"--- Модель роста диаметра для зерна {grain_value} ---\n{grain_result.model_summary}")
+            summary_parts.append(f"--- {spec['summary']} для зерна {grain_value} ---\n{grain_result.model_summary}")
             for _, row in grain_result.params.iterrows():
                 param_rows.append(
                     {
@@ -629,14 +670,11 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
                         "Верхняя 95% граница": row["Верхняя 95% граница"],
                     }
                 )
-
         if not result_frames:
             raise ValueError("Не удалось построить ни одной модели роста диаметра по отдельным зернам: недостаточно данных.")
-
         result_df = pd.concat(result_frames, ignore_index=True)
         params = pd.DataFrame(param_rows)
         metrics = build_metrics(result_df, predictor_count=2)
-
         real_grain = REAL_WORLD_POINT["G"]
         matching = params[params["Параметр модели"].str.startswith(f"grain_{real_grain}_")]
         if matching.empty:
@@ -647,7 +685,7 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
                 row["Параметр модели"].split(f"grain_{real_grain}_", 1)[1]: row["Значение"]
                 for _, row in matching.iterrows()
             }
-            real_temp = predict_temperature_diameter_growth(grain_params, REAL_WORLD_POINT["D"], REAL_WORLD_POINT["tau"])
+            real_temp = predict_temperature_diameter_variant(grain_params, REAL_WORLD_POINT["D"], REAL_WORLD_POINT["tau"], variant=variant)
             metrics["Прогноз для реальной точки, °C"] = float(real_temp)
             if REAL_WORLD_POINT["temp_min"] <= real_temp <= REAL_WORLD_POINT["temp_max"]:
                 metrics["Отклонение реальной точки от диапазона, °C"] = 0.0
@@ -655,52 +693,37 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
                 metrics["Отклонение реальной точки от диапазона, °C"] = REAL_WORLD_POINT["temp_min"] - real_temp
             else:
                 metrics["Отклонение реальной точки от диапазона, °C"] = real_temp - REAL_WORLD_POINT["temp_max"]
-
-        weak_points = result_df.sort_values(
-            by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
-        ).copy()
-        outlier_recommendation = weak_points[
-            (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
-            | (np.abs(weak_points["standard_residual"]) > 2)
-        ].copy()
+        weak_points = result_df.sort_values(by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]).copy()
+        outlier_recommendation = weak_points[(weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9)) | (np.abs(weak_points["standard_residual"]) > 2)].copy()
         return FitResult(
             data=result_df,
             metrics=metrics,
             params=params,
             weak_points=weak_points,
-            model_summary="Модели роста диаметра по отдельным зернам.\n\n" + "\n\n".join(summary_parts),
+            model_summary=f"{spec['summary']} по отдельным зернам.\n\n" + "\n\n".join(summary_parts),
             outlier_recommendation=outlier_recommendation,
-            formula_text=(
-                "Для каждого номера зерна отдельно: ln(D)=a_G+b_G·ln(τ)+c_G·ln((T-550)/350)\n"
-                "Нижняя физическая граница 550 °C заложена внутрь самой температурной переменной."
-            ),
-            model_label="Эмпирические модели роста диаметра по отдельным зернам с температурным порогом 550 °C",
+            formula_text=f"Для каждого номера зерна отдельно: {spec['formula'].replace(' = ', '=')}",
+            model_label=f"{spec['label']} по отдельным зернам",
         )
 
     work_df = df.copy()
-    work_df["ln_temp_factor"] = diameter_temperature_factor(work_df["T"])
-
-    feature_columns = ["ln_tau", "ln_temp_factor"]
+    work_df[spec["param"]] = spec["feature_builder"](work_df)
+    feature_columns = ["ln_tau", spec["param"]]
     X = sm.add_constant(work_df[feature_columns])
-    y = df["ln_D"]
-
+    y = work_df["ln_D"]
     model = sm.OLS(y, X).fit()
     influence = model.get_influence()
 
-    a2 = model.params.get("ln_temp_factor", np.nan)
-    if not np.isfinite(a2) or abs(a2) < 1e-12:
-        raise ValueError("Коэффициент при температурном факторе в модели роста диаметра слишком мал для устойчивого обратного расчета.")
+    temp_coef = model.params.get(spec["param"], np.nan)
+    if not np.isfinite(temp_coef) or abs(temp_coef) < 1e-12:
+        raise ValueError("Коэффициент при температурном члене слишком мал для устойчивого обратного расчета.")
 
-    numerator = df["ln_D"] - model.params.get("const", 0.0) - model.params.get("ln_tau", 0.0) * df["ln_tau"]
-    ln_temp_factor_pred = numerator / a2
-    temp_c_pred = np.clip(
-        PHYSICAL_TEMP_MIN_C + (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C) * np.exp(ln_temp_factor_pred),
-        PHYSICAL_TEMP_MIN_C,
-        PHYSICAL_TEMP_MAX_C,
-    )
+    numerator = work_df["ln_D"] - model.params.get("const", 0.0) - model.params.get("ln_tau", 0.0) * work_df["ln_tau"]
+    temp_feature_pred = numerator / temp_coef
+    temp_c_pred = spec["inverse_builder"](temp_feature_pred)
 
     result_df = df.copy()
-    result_df["ln_temp_factor_pred"] = ln_temp_factor_pred
+    result_df[f"{spec['param']}_pred"] = temp_feature_pred
     result_df["T_pred"] = temp_c_pred
     result_df["error_celsius"] = result_df["T"] - result_df["T_pred"]
     result_df["abs_error"] = np.abs(result_df["error_celsius"])
@@ -709,38 +732,28 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
     result_df["leverage"] = influence.hat_matrix_diag
     result_df["cooks_distance"] = influence.cooks_distance[0]
 
-    weak_points = result_df.sort_values(
-        by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]
-    ).copy()
-    outlier_recommendation = weak_points[
-        (weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9))
-        | (np.abs(weak_points["standard_residual"]) > 2)
-        | (weak_points["cooks_distance"] > 4 / len(result_df))
-    ].copy()
-
+    weak_points = result_df.sort_values(by=["abs_error", "cooks_distance", "standard_residual"], ascending=[False, False, False]).copy()
+    outlier_recommendation = weak_points[(weak_points["abs_error"] >= weak_points["abs_error"].quantile(0.9)) | (np.abs(weak_points["standard_residual"]) > 2) | (weak_points["cooks_distance"] > 4 / len(result_df))].copy()
     conf_int = model.conf_int()
     params = pd.DataFrame(
         {
             "Коэффициент": ["a", "b", "c"],
-            "Параметр модели": ["const", "ln_tau", "ln_temp_factor"],
-            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get("ln_temp_factor", np.nan)],
-            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get("ln_temp_factor", np.nan)],
-            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get("ln_temp_factor", np.nan)],
-            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get("ln_temp_factor", np.nan)],
-            "Нижняя 95% граница": [conf_int.loc["const", 0], conf_int.loc["ln_tau", 0], conf_int.loc["ln_temp_factor", 0]],
-            "Верхняя 95% граница": [conf_int.loc["const", 1], conf_int.loc["ln_tau", 1], conf_int.loc["ln_temp_factor", 1]],
+            "Параметр модели": ["const", "ln_tau", spec["param"]],
+            "Значение": [model.params.get("const", np.nan), model.params.get("ln_tau", np.nan), model.params.get(spec["param"], np.nan)],
+            "StdErr": [model.bse.get("const", np.nan), model.bse.get("ln_tau", np.nan), model.bse.get(spec["param"], np.nan)],
+            "t-статистика": [model.tvalues.get("const", np.nan), model.tvalues.get("ln_tau", np.nan), model.tvalues.get(spec["param"], np.nan)],
+            "p-value": [model.pvalues.get("const", np.nan), model.pvalues.get("ln_tau", np.nan), model.pvalues.get(spec["param"], np.nan)],
+            "Нижняя 95% граница": [conf_int.loc["const", 0], conf_int.loc["ln_tau", 0], conf_int.loc[spec["param"], 0]],
+            "Верхняя 95% граница": [conf_int.loc["const", 1], conf_int.loc["ln_tau", 1], conf_int.loc[spec["param"], 1]],
         }
     )
-
     metrics = build_metrics(result_df, predictor_count=len(feature_columns))
     formula_text = (
-        "ln(D) = a + b·ln(τ) + c·ln((T - 550) / 350)\n"
+        f"{spec['formula']}\n"
         f"a = {model.params.get('const', np.nan):.8f}\n"
         f"b = {model.params.get('ln_tau', np.nan):.8f}\n"
-        f"c = {model.params.get('ln_temp_factor', np.nan):.8f}\n"
-        f"Итог: ln(D) = {model.params.get('const', np.nan):.8f} + ({model.params.get('ln_tau', np.nan):.8f})·ln(τ) + ({model.params.get('ln_temp_factor', np.nan):.8f})·ln((T - 550) / 350)"
+        f"c = {model.params.get(spec['param'], np.nan):.8f}"
     )
-
     return FitResult(
         data=result_df,
         metrics=metrics,
@@ -749,8 +762,20 @@ def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> 
         model_summary=model.summary().as_text(),
         outlier_recommendation=outlier_recommendation,
         formula_text=formula_text,
-        model_label="Эмпирическая модель роста диаметра ln(D)=a+b·ln(τ)+c·ln((T-550)/350)",
+        model_label=spec["label"],
     )
+
+
+def fit_diameter_growth_model(df: pd.DataFrame, include_grain: bool = False) -> FitResult:
+    return fit_diameter_variant_model(df, include_grain=include_grain, variant="original")
+
+
+def fit_diameter_growth_model_alt2(df: pd.DataFrame, include_grain: bool = False) -> FitResult:
+    return fit_diameter_variant_model(df, include_grain=include_grain, variant="alt2")
+
+
+def fit_diameter_growth_model_alt3(df: pd.DataFrame, include_grain: bool = False) -> FitResult:
+    return fit_diameter_variant_model(df, include_grain=include_grain, variant="alt3")
 
 
 def fit_anchor_saturation_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
@@ -1259,24 +1284,42 @@ def predict_temperature_improved(params: dict[str, float], D: float, tau: float,
     return 1.0 / inv_t - 273.15
 
 
-def predict_temperature_diameter_growth(params: dict[str, float], D: float, tau: float) -> float:
-    a2 = params.get("ln_temp_factor", np.nan)
+def predict_temperature_diameter_variant(params: dict[str, float], D: float, tau: float, variant: str) -> float:
+    if variant == "original":
+        param_name = "inv_T"
+        inverse = lambda feature: 1.0 / feature - 273.15
+    elif variant == "alt2":
+        param_name = "ln_temp_factor"
+        inverse = diameter_temperature_factor_inverse
+    elif variant == "alt3":
+        param_name = "inv_T_excess"
+        inverse = diameter_inverse_excess_temperature_inverse
+    else:
+        raise ValueError(f"Неизвестный вариант модели диаметра: {variant}")
+
+    a2 = params.get(param_name, np.nan)
     if not np.isfinite(a2) or abs(a2) < 1e-12:
-        raise ValueError("В модели роста диаметра коэффициент при температурном факторе слишком мал для устойчивого расчета.")
-    ln_temp_factor = (np.log(D) - params.get("const", 0.0) - params.get("ln_tau", 0.0) * np.log(tau)) / a2
-    return float(
-        np.clip(
-            PHYSICAL_TEMP_MIN_C + (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C) * np.exp(ln_temp_factor),
-            PHYSICAL_TEMP_MIN_C,
-            PHYSICAL_TEMP_MAX_C,
-        )
-    )
+        raise ValueError("В модели роста диаметра коэффициент при температурном члене слишком мал для устойчивого расчета.")
+    temp_feature = (np.log(D) - params.get("const", 0.0) - params.get("ln_tau", 0.0) * np.log(tau)) / a2
+    return float(inverse(temp_feature))
+
+
+def predict_temperature_diameter_growth(params: dict[str, float], D: float, tau: float) -> float:
+    return predict_temperature_diameter_variant(params, D, tau, variant="original")
+
+
+def predict_temperature_diameter_growth_alt2(params: dict[str, float], D: float, tau: float) -> float:
+    return predict_temperature_diameter_variant(params, D, tau, variant="alt2")
+
+
+def predict_temperature_diameter_growth_alt3(params: dict[str, float], D: float, tau: float) -> float:
+    return predict_temperature_diameter_variant(params, D, tau, variant="alt3")
 
 
 def predict_temperature_diameter_grain_model(
     params: dict[str, float], D: float, tau: float, G: float | None = None
 ) -> float:
-    if all(key in params for key in ["const", "ln_tau", "ln_temp_factor"]):
+    if all(key in params for key in ["const", "ln_tau", "inv_T"]):
         grain_params = params
     else:
         if G is None:
@@ -1292,27 +1335,64 @@ def predict_temperature_diameter_grain_model(
     return predict_temperature_diameter_growth(grain_params, D, tau)
 
 
-def build_cleaned_diameter_grain_results(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, FitResult]:
+def predict_temperature_diameter_grain_model_alt2(
+    params: dict[str, float], D: float, tau: float, G: float | None = None
+) -> float:
+    return predict_temperature_diameter_grain_variant(params, D, tau, G, variant="alt2")
+
+
+def predict_temperature_diameter_grain_model_alt3(
+    params: dict[str, float], D: float, tau: float, G: float | None = None
+) -> float:
+    return predict_temperature_diameter_grain_variant(params, D, tau, G, variant="alt3")
+
+
+def predict_temperature_diameter_grain_variant(
+    params: dict[str, float], D: float, tau: float, G: float | None, variant: str
+) -> float:
+    variant_param = {"original": "inv_T", "alt2": "ln_temp_factor", "alt3": "inv_T_excess"}[variant]
+    if all(key in params for key in ["const", "ln_tau", variant_param]):
+        grain_params = params
+    else:
+        if G is None:
+            raise ValueError("Для модели роста диаметра по зернам нужно указать номер зерна G.")
+        grain_key = f"grain_{float(G)}_"
+        grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
+        if not grain_params:
+            grain_key = f"grain_{int(round(float(G)))}_"
+            grain_params = {k[len(grain_key):]: v for k, v in params.items() if k.startswith(grain_key)}
+        if not grain_params:
+            raise ValueError(f"Для номера зерна G={G} нет отдельной модели роста диаметра.")
+    return predict_temperature_diameter_variant(grain_params, D, tau, variant=variant)
+
+
+def build_cleaned_diameter_grain_results_variant(
+    prepared_df: pd.DataFrame, valid_grains: list[float], fit_function, state_key_prefix: str
+) -> dict[float, FitResult]:
     cleaned_results: dict[float, FitResult] = {}
     for grain in valid_grains:
         grain_df = prepared_df[prepared_df["G"] == grain].copy()
         if len(grain_df) < 7:
             continue
         try:
-            result = fit_diameter_growth_model(grain_df, include_grain=False)
+            result = fit_function(grain_df, include_grain=False)
         except Exception:
             continue
-        apply_key = f"applied_exclude_diameter_grain_{grain}"
+        apply_key = f"applied_exclude_{state_key_prefix}_{grain}"
         selected = st.session_state.get(apply_key, [])
         if selected:
             filtered = grain_df[~grain_df["point_id"].astype(str).isin(selected)].copy()
             if len(filtered) >= 7:
                 try:
-                    result = fit_diameter_growth_model(filtered, include_grain=False)
+                    result = fit_function(filtered, include_grain=False)
                 except Exception:
                     pass
         cleaned_results[grain] = result
     return cleaned_results
+
+
+def build_cleaned_diameter_grain_results(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, FitResult]:
+    return build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_diameter_growth_model, "diameter_grain")
 
 
 def build_cleaned_sigma_grain_results(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, FitResult]:
@@ -1351,23 +1431,29 @@ def get_recommended_sigma_exclusions(prepared_df: pd.DataFrame, valid_grains: li
     return recommendations
 
 
-def get_recommended_diameter_exclusions(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, list[str]]:
+def get_recommended_diameter_exclusions_variant(prepared_df: pd.DataFrame, valid_grains: list[float], fit_function) -> dict[float, list[str]]:
     recommendations: dict[float, list[str]] = {}
     for grain in valid_grains:
         grain_df = prepared_df[prepared_df["G"] == grain].copy()
         if len(grain_df) < 7:
             continue
         try:
-            result = fit_diameter_growth_model(grain_df, include_grain=False)
+            result = fit_function(grain_df, include_grain=False)
         except Exception:
             continue
         recommendations[grain] = result.outlier_recommendation["point_id"].astype(str).tolist()
     return recommendations
 
 
-def fit_diameter_universal_grain_size_model(
+def get_recommended_diameter_exclusions(prepared_df: pd.DataFrame, valid_grains: list[float]) -> dict[float, list[str]]:
+    return get_recommended_diameter_exclusions_variant(prepared_df, valid_grains, fit_diameter_growth_model)
+
+
+def fit_diameter_universal_grain_size_model_variant(
     cleaned_results: dict[float, FitResult],
-    variant: str = "quadratic_full",
+    variant: str,
+    temp_param_name: str,
+    formula_label: str,
 ) -> tuple[dict[str, float], pd.DataFrame, str]:
     rows: list[dict[str, float]] = []
     for grain, result in cleaned_results.items():
@@ -1382,7 +1468,7 @@ def fit_diameter_universal_grain_size_model(
                 "ln_grain_size": float(np.log(grain_size)),
                 "a": float(params.get("const", np.nan)),
                 "b": float(params.get("ln_tau", np.nan)),
-                "c": float(params.get("ln_temp_factor", np.nan)),
+                "c": float(params.get(temp_param_name, np.nan)),
                 "R²": float(result.metrics.get("R²", np.nan)),
             }
         )
@@ -1423,9 +1509,45 @@ def fit_diameter_universal_grain_size_model(
         f"b(dg)=beta0+beta1·ln(dg)+beta2·[ln(dg)]², R²={model_b.rsquared:.4f}\n"
         f"c(dg)=gamma0+gamma1·ln(dg)+gamma2·[ln(dg)]², R²={model_c.rsquared:.4f}\n"
         f"Использованы все зерна: {included_grains}\n"
-        "Итоговая форма: ln(D)=a(dg)+b(dg)·ln(τ)+c(dg)·ln((T-550)/350)"
+        f"Итоговая форма: {formula_label}"
     )
     return params, coeff_df, summary_text
+
+
+def fit_diameter_universal_grain_size_model(
+    cleaned_results: dict[float, FitResult],
+    variant: str = "quadratic_full",
+) -> tuple[dict[str, float], pd.DataFrame, str]:
+    return fit_diameter_universal_grain_size_model_variant(
+        cleaned_results,
+        variant=variant,
+        temp_param_name="inv_T",
+        formula_label="ln(D)=a(dg)+b(dg)·ln(τ)+c(dg)·(1/T(K))",
+    )
+
+
+def fit_diameter_universal_grain_size_model_alt2(
+    cleaned_results: dict[float, FitResult],
+    variant: str = "quadratic_full",
+) -> tuple[dict[str, float], pd.DataFrame, str]:
+    return fit_diameter_universal_grain_size_model_variant(
+        cleaned_results,
+        variant=variant,
+        temp_param_name="ln_temp_factor",
+        formula_label="ln(D)=a(dg)+b(dg)·ln(τ)+c(dg)·ln((T-550)/350)",
+    )
+
+
+def fit_diameter_universal_grain_size_model_alt3(
+    cleaned_results: dict[float, FitResult],
+    variant: str = "quadratic_full",
+) -> tuple[dict[str, float], pd.DataFrame, str]:
+    return fit_diameter_universal_grain_size_model_variant(
+        cleaned_results,
+        variant=variant,
+        temp_param_name="inv_T_excess",
+        formula_label="ln(D)=a(dg)+b(dg)·ln(τ)+c(dg)·(1/(T-550+273.15))",
+    )
 
 
 def analyze_coefficient_forms(coeff_df: pd.DataFrame, coeff_name: str) -> pd.DataFrame:
@@ -1565,7 +1687,7 @@ def build_sigma_coefficient_df(
     return pd.DataFrame(rows).dropna().sort_values(by=["G"]).reset_index(drop=True)
 
 
-def predict_temperature_diameter_universal(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
+def predict_temperature_diameter_universal_variant(params: dict[str, float], D: float, tau: float, grain_size_mm: float, variant: str) -> float:
     ln_g = np.log(grain_size_mm)
     a_val = params["alpha0"] + params["alpha1"] * ln_g + params["alpha2"] * (ln_g ** 2)
     if is_finite_number(params.get("b_const", np.nan)):
@@ -1574,15 +1696,29 @@ def predict_temperature_diameter_universal(params: dict[str, float], D: float, t
         b_val = params["beta0"] + params["beta1"] * ln_g + params["beta2"] * (ln_g ** 2)
     c_val = params["gamma0"] + params["gamma1"] * ln_g + params["gamma2"] * (ln_g ** 2)
     if not np.isfinite(c_val) or abs(c_val) < 1e-12:
-        raise ValueError("Универсальная модель дала слишком малый коэффициент при температурном факторе.")
-    ln_temp_factor = (np.log(D) - a_val - b_val * np.log(tau)) / c_val
-    return float(
-        np.clip(
-            PHYSICAL_TEMP_MIN_C + (PHYSICAL_TEMP_MAX_C - PHYSICAL_TEMP_MIN_C) * np.exp(ln_temp_factor),
-            PHYSICAL_TEMP_MIN_C,
-            PHYSICAL_TEMP_MAX_C,
-        )
-    )
+        raise ValueError("Универсальная модель дала слишком малый коэффициент при температурном члене.")
+    temp_feature = (np.log(D) - a_val - b_val * np.log(tau)) / c_val
+    if variant == "original":
+        if not np.isfinite(temp_feature) or temp_feature <= 0:
+            raise ValueError("Универсальная модель дала неположительное значение 1/T.")
+        return float(1.0 / temp_feature - 273.15)
+    if variant == "alt2":
+        return float(diameter_temperature_factor_inverse(temp_feature))
+    if variant == "alt3":
+        return float(diameter_inverse_excess_temperature_inverse(temp_feature))
+    raise ValueError(f"Неизвестный вариант модели диаметра: {variant}")
+
+
+def predict_temperature_diameter_universal(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
+    return predict_temperature_diameter_universal_variant(params, D, tau, grain_size_mm, variant="original")
+
+
+def predict_temperature_diameter_universal_alt2(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
+    return predict_temperature_diameter_universal_variant(params, D, tau, grain_size_mm, variant="alt2")
+
+
+def predict_temperature_diameter_universal_alt3(params: dict[str, float], D: float, tau: float, grain_size_mm: float) -> float:
+    return predict_temperature_diameter_universal_variant(params, D, tau, grain_size_mm, variant="alt3")
 
 
 def predict_temperature_sigma_universal(params: dict[str, float], tau: float, c_sigma: float, grain_size_mm: float) -> float:
@@ -1635,7 +1771,7 @@ def evaluate_sigma_universal_model(params: dict[str, float], cleaned_results: di
     }
 
 
-def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results: dict[float, FitResult]) -> dict[str, float]:
+def evaluate_diameter_universal_model_variant(params: dict[str, float], cleaned_results: dict[float, FitResult], variant: str) -> dict[str, float]:
     rows: list[pd.DataFrame] = []
     total_points = 0
     total_models = 0
@@ -1647,7 +1783,7 @@ def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results:
         total_points += int(result.metrics.get("Количество точек", len(result.data)))
         df = result.data.copy()
         df["T_pred_universal"] = df.apply(
-            lambda row: predict_temperature_diameter_universal(params, float(row["D"]), float(row["tau"]), grain_size),
+            lambda row: predict_temperature_diameter_universal_variant(params, float(row["D"]), float(row["tau"]), grain_size, variant),
             axis=1,
         )
         rows.append(df)
@@ -1663,6 +1799,18 @@ def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results:
         "MAE по T, °C": float(mean_absolute_error(eval_df["T"], eval_df["T_pred_universal"])),
         "MAPE по T, %": float(np.mean(np.abs(errors) / np.maximum(np.abs(eval_df["T"]), 1e-9)) * 100.0),
     }
+
+
+def evaluate_diameter_universal_model(params: dict[str, float], cleaned_results: dict[float, FitResult]) -> dict[str, float]:
+    return evaluate_diameter_universal_model_variant(params, cleaned_results, variant="original")
+
+
+def evaluate_diameter_universal_model_alt2(params: dict[str, float], cleaned_results: dict[float, FitResult]) -> dict[str, float]:
+    return evaluate_diameter_universal_model_variant(params, cleaned_results, variant="alt2")
+
+
+def evaluate_diameter_universal_model_alt3(params: dict[str, float], cleaned_results: dict[float, FitResult]) -> dict[str, float]:
+    return evaluate_diameter_universal_model_variant(params, cleaned_results, variant="alt3")
 
 
 def predict_temperature_sigma_formula(grain_number: float, c_sigma: float, tau: float) -> float:
@@ -1984,7 +2132,7 @@ def build_diameter_grain_report(cleaned_diameter_results: dict[float, FitResult]
                 "Количество точек": float(result.metrics.get("Количество точек", len(result.data))),
                 "a": float(params.get("const", np.nan)),
                 "b": float(params.get("ln_tau", np.nan)),
-                "c": float(params.get("ln_temp_factor", np.nan)),
+                "c": float(params.get("inv_T", np.nan)),
                 "R² по T": float(result.metrics.get("R²", np.nan)),
                 "RMSE по T, °C": float(result.metrics.get("RMSE, °C", np.nan)),
                 "MAE по T, °C": float(result.metrics.get("MAE, °C", np.nan)),
@@ -2278,8 +2426,8 @@ def clear_diameter_when_sigma_entered() -> None:
         st.session_state["universal_choice_d"] = ""
 
 
-def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
-    st.subheader(f"Модель роста диаметра для номера зерна {grain_value}")
+def show_diameter_variant_grain_block(result: FitResult, grain_value: float, title: str, key_prefix: str, fit_function) -> None:
+    st.subheader(f"{title} для номера зерна {grain_value}")
     metric_cards(result.metrics)
     st.subheader("Коэффициенты модели")
     st.dataframe(result.params, use_container_width=True, hide_index=True)
@@ -2311,22 +2459,37 @@ def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
         submitted = st.form_submit_button("Рассчитать")
     if submitted:
         try:
-            temp_value = predict_temperature_diameter_growth(calc_params, d_value, tau_value)
+            predictor = {
+                "diameter_grain": predict_temperature_diameter_growth,
+                "diameter_alt2_grain": predict_temperature_diameter_growth_alt2,
+                "diameter_alt3_grain": predict_temperature_diameter_growth_alt3,
+            }[key_prefix]
+            temp_value = predictor(calc_params, d_value, tau_value)
             st.metric("Расчетная температура по модели диаметра, °C", format_temperature_interpretation(temp_value))
-            if temp_value <= PHYSICAL_TEMP_MIN_C:
-                st.caption("В модели роста диаметра температурный фактор задан через ln((T - 550) / 350), поэтому порог 550 °C встроен в саму формулу.")
         except Exception as exc:
             st.error(f"Не удалось выполнить расчет по модели диаметра: {exc}")
 
     show_result_block(
         result,
-        key_prefix=f"diameter_grain_{grain_value}",
+        key_prefix=f"{key_prefix}_{grain_value}",
         include_grain=False,
-        fit_function=fit_diameter_growth_model,
+        fit_function=fit_function,
         preselect_outliers=True,
         auto_apply_selected=False,
         min_interpretable_temp=550.0,
     )
+
+
+def show_diameter_grain_block(result: FitResult, grain_value: float) -> None:
+    show_diameter_variant_grain_block(result, grain_value, "Исходная модель роста диаметра", "diameter_grain", fit_diameter_growth_model)
+
+
+def show_diameter_alt2_grain_block(result: FitResult, grain_value: float) -> None:
+    show_diameter_variant_grain_block(result, grain_value, "Альтернативная модель 2 роста диаметра", "diameter_alt2_grain", fit_diameter_growth_model_alt2)
+
+
+def show_diameter_alt3_grain_block(result: FitResult, grain_value: float) -> None:
+    show_diameter_variant_grain_block(result, grain_value, "Альтернативная модель 3 роста диаметра", "diameter_alt3_grain", fit_diameter_growth_model_alt3)
 
 
 def predict_temperature_anchor_saturation(
@@ -3581,126 +3744,232 @@ with improved_tab:
 
 with diameter_tab:
     st.write(
-        "Модель роста диаметра тоже строится отдельно для каждого номера зерна. "
-        "Для каждого G используется своя зависимость ln(D) = a + b·ln(τ) + c·(1/T), потому что скорость укрупнения сильно зависит от зерна."
+        "Здесь можно сравнить исходную модель роста диаметра и две альтернативные температурные постановки. "
+        "Во всех вариантах доступны исключение выпадающих точек и отдельная универсальная модель по размеру зерна."
     )
-    diameter_grain_scores: list[dict[str, float]] = []
     if not valid_grains:
         st.warning("Для отдельных номеров зерна пока недостаточно точек. Нужно минимум 7 точек на номер зерна.")
     else:
-        local_tab, universal_tab = st.tabs(["Модели по отдельным зернам", "Универсальная модель"])
-        with local_tab:
-            cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
-            selected_diameter_grain = st.selectbox("Выберите номер зерна для модели диаметра", valid_grains)
-            for grain in valid_grains:
-                grain_df = prepared_df[prepared_df["G"] == grain].copy()
-                try:
-                    grain_result = cleaned_diameter_results.get(grain) or fit_diameter_growth_model(grain_df, include_grain=False)
-                    diameter_grain_scores.append(
+        original_tab, alt2_tab, alt3_tab, compare_variants_tab = st.tabs([
+            "Исходная модель",
+            "Альтернатива 2",
+            "Альтернатива 3",
+            "Сравнение 3 вариантов",
+        ])
+
+        def render_diameter_variant_section(
+            title: str,
+            fit_function,
+            show_block,
+            state_prefix: str,
+            universal_fit_function,
+            universal_eval_function,
+            universal_predictor,
+            formula_header: str,
+        ) -> None:
+            local_tab, universal_tab = st.tabs(["Модели по отдельным зернам", "Универсальная модель"])
+            with local_tab:
+                cleaned_results = build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_function, state_prefix)
+                score_rows: list[dict[str, float]] = []
+                selected_grain = st.selectbox(f"Выберите номер зерна: {title}", valid_grains, key=f"select_{state_prefix}")
+                for grain in valid_grains:
+                    grain_df = prepared_df[prepared_df["G"] == grain].copy()
+                    try:
+                        grain_result = cleaned_results.get(grain) or fit_function(grain_df, include_grain=False)
+                        score_rows.append(
+                            {
+                                "Номер зерна": grain,
+                                "Количество точек": grain_result.metrics["Количество точек"],
+                                "R²": grain_result.metrics["R²"],
+                                "RMSE, °C": grain_result.metrics["RMSE, °C"],
+                                "MAE, °C": grain_result.metrics["MAE, °C"],
+                                "MAPE, %": grain_result.metrics["MAPE, %"],
+                            }
+                        )
+                        if grain == selected_grain:
+                            show_block(grain_result, grain)
+                    except Exception:
+                        continue
+                if score_rows:
+                    st.subheader(f"Сводка по зернам: {title}")
+                    st.dataframe(
+                        pd.DataFrame(score_rows).sort_values(by=["R²", "RMSE, °C", "MAPE, %"], ascending=[False, True, True]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            with universal_tab:
+                recommended_exclusions = get_recommended_diameter_exclusions_variant(prepared_df, valid_grains, fit_function)
+                selected_grains_for_recommended = st.multiselect(
+                    "Для каких номеров зерна добавить рекомендованные системой точки в исключения",
+                    options=valid_grains,
+                    default=[],
+                    key=f"picker_{state_prefix}",
+                )
+                c_apply_all, c_reset_all = st.columns(2)
+                with c_apply_all:
+                    if st.button("Применить рекомендованные точки для выбранных зерен", key=f"apply_all_{state_prefix}"):
+                        for grain in selected_grains_for_recommended:
+                            labels = recommended_exclusions.get(grain, [])
+                            apply_key = f"applied_exclude_{state_prefix}_{grain}"
+                            merged = sorted(set(st.session_state.get(apply_key, [])) | set(labels))
+                            st.session_state[apply_key] = merged
+                            st.session_state[f"pending_sync_{state_prefix}_{grain}"] = True
+                        st.rerun()
+                with c_reset_all:
+                    if st.button("Сбросить все исключения", key=f"reset_all_{state_prefix}"):
+                        for grain in valid_grains:
+                            st.session_state[f"applied_exclude_{state_prefix}_{grain}"] = []
+                            st.session_state[f"pending_sync_{state_prefix}_{grain}"] = True
+                        st.rerun()
+
+                active_rows = []
+                for grain in valid_grains:
+                    active_rows.append(
                         {
                             "Номер зерна": grain,
-                            "Количество точек": grain_result.metrics["Количество точек"],
-                            "R²": grain_result.metrics["R²"],
-                            "RMSE, °C": grain_result.metrics["RMSE, °C"],
-                            "MAE, °C": grain_result.metrics["MAE, °C"],
-                            "MAPE, %": grain_result.metrics["MAPE, %"],
+                            "Рекомендовано исключить": len(recommended_exclusions.get(grain, [])),
+                            "Сейчас исключено": len(st.session_state.get(f"applied_exclude_{state_prefix}_{grain}", [])),
                         }
                     )
-                    if grain == selected_diameter_grain:
-                        show_diameter_grain_block(grain_result, grain)
-                except Exception:
-                    continue
+                st.dataframe(pd.DataFrame(active_rows), use_container_width=True, hide_index=True)
 
-            if diameter_grain_scores:
-                st.subheader("Сравнение моделей роста диаметра по номерам зерна")
-                diameter_score_df = pd.DataFrame(diameter_grain_scores).sort_values(
-                    by=["R²", "RMSE, °C", "MAPE, %"],
-                    ascending=[False, True, True],
-                )
-                st.dataframe(diameter_score_df, use_container_width=True, hide_index=True)
-                best_diameter_grain = diameter_score_df.iloc[0]
-                st.info(
-                    f"Лучше всего модель роста диаметра сейчас выглядит для номера зерна {best_diameter_grain['Номер зерна']}: "
-                    f"R²={best_diameter_grain['R²']:.4f}, RMSE={best_diameter_grain['RMSE, °C']:.4f} °C."
-                )
+                cleaned_results = build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_function, state_prefix)
+                try:
+                    universal_params, coeff_df, universal_summary = universal_fit_function(cleaned_results, variant="quadratic_full")
+                    universal_eval = universal_eval_function(universal_params, cleaned_results)
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "R² для a(dg)": universal_params["r2_a"],
+                                    "R² для b(dg)": universal_params["r2_b"],
+                                    "R² для c(dg)": universal_params["r2_c"],
+                                    "R² по T": universal_eval["R² по T"],
+                                    "RMSE по T, °C": universal_eval["RMSE по T, °C"],
+                                    "Количество точек": universal_eval["Количество точек"],
+                                }
+                            ]
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.code(
+                        "\n".join(
+                            [
+                                formula_header,
+                                "a(dg) = alpha0 + alpha1·ln(dg) + alpha2·[ln(dg)]²",
+                                "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²",
+                                "c(dg) = gamma0 + gamma1·ln(dg) + gamma2·[ln(dg)]²",
+                                f"alpha0 = {fmt_trimmed(universal_params['alpha0'], 4)}, alpha1 = {fmt_trimmed(universal_params['alpha1'], 4)}, alpha2 = {fmt_trimmed(universal_params['alpha2'], 4)}",
+                                f"beta0 = {fmt_trimmed(universal_params['beta0'], 4)}, beta1 = {fmt_trimmed(universal_params['beta1'], 4)}, beta2 = {fmt_trimmed(universal_params['beta2'], 4)}",
+                                f"gamma0 = {fmt_trimmed(universal_params['gamma0'], 4)}, gamma1 = {fmt_trimmed(universal_params['gamma1'], 4)}, gamma2 = {fmt_trimmed(universal_params['gamma2'], 4)}",
+                            ]
+                        ),
+                        language="text",
+                    )
+                    st.dataframe(coeff_df, use_container_width=True, hide_index=True)
+                    with st.expander("Сводка по универсальной модели"):
+                        st.text(universal_summary)
 
-        with universal_tab:
-            recommended_exclusions = get_recommended_diameter_exclusions(prepared_df, valid_grains)
-            c_apply_all, c_reset_all = st.columns(2)
-            with c_apply_all:
-                if st.button("Применить все рекомендованные исключения по всем зернам", key="apply_all_diameter_exclusions"):
-                    for grain, labels in recommended_exclusions.items():
-                        st.session_state[f"applied_exclude_diameter_grain_{grain}"] = list(labels)
-            with c_reset_all:
-                if st.button("Сбросить все исключения по росту диаметра", key="reset_all_diameter_exclusions"):
-                    for grain in valid_grains:
-                        st.session_state[f"applied_exclude_diameter_grain_{grain}"] = []
+                    st.subheader("Калькулятор температуры по универсальной модели")
+                    with st.form(key=f"universal_form_{state_prefix}"):
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            tau_value = st.number_input("Время наработки τ", min_value=1.0, value=1000.0, step=1.0, format="%.0f", key=f"tau_{state_prefix}")
+                        with c2:
+                            d_value = st.number_input("Эквивалентный диаметр D", min_value=0.01, value=10.0, step=0.01, format="%.2f", key=f"D_{state_prefix}")
+                        with c3:
+                            grain_number = st.selectbox("Номер зерна", sorted(GRAIN_SIZE_MM.keys()), key=f"grain_{state_prefix}")
+                        submitted = st.form_submit_button("Рассчитать")
+                    if submitted:
+                        try:
+                            temp_value = universal_predictor(universal_params, d_value, tau_value, GRAIN_SIZE_MM[float(grain_number)])
+                            st.metric("Расчетная температура по универсальной модели, °C", format_temperature_interpretation(temp_value))
+                        except Exception as exc:
+                            st.error(f"Не удалось выполнить расчет по универсальной модели: {exc}")
+                except Exception as exc:
+                    st.error(f"Не удалось собрать универсальную модель по размеру зерна: {exc}")
 
-            active_rows = []
+        with original_tab:
+            render_diameter_variant_section(
+                "Исходная модель",
+                fit_diameter_growth_model,
+                show_diameter_grain_block,
+                "diameter_grain",
+                fit_diameter_universal_grain_size_model,
+                evaluate_diameter_universal_model,
+                predict_temperature_diameter_universal,
+                "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1/T(K))",
+            )
+
+        with alt2_tab:
+            render_diameter_variant_section(
+                "Альтернатива 2",
+                fit_diameter_growth_model_alt2,
+                show_diameter_alt2_grain_block,
+                "diameter_alt2_grain",
+                fit_diameter_universal_grain_size_model_alt2,
+                evaluate_diameter_universal_model_alt2,
+                predict_temperature_diameter_universal_alt2,
+                "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·ln((T - 550) / 350)",
+            )
+
+        with alt3_tab:
+            render_diameter_variant_section(
+                "Альтернатива 3",
+                fit_diameter_growth_model_alt3,
+                show_diameter_alt3_grain_block,
+                "diameter_alt3_grain",
+                fit_diameter_universal_grain_size_model_alt3,
+                evaluate_diameter_universal_model_alt3,
+                predict_temperature_diameter_universal_alt3,
+                "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1 / (T - 550 + 273.15))",
+            )
+
+        with compare_variants_tab:
+            compare_rows = []
+            cleaned_variants = {
+                "Исходная": build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_diameter_growth_model, "diameter_grain"),
+                "Альтернатива 2": build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_diameter_growth_model_alt2, "diameter_alt2_grain"),
+                "Альтернатива 3": build_cleaned_diameter_grain_results_variant(prepared_df, valid_grains, fit_diameter_growth_model_alt3, "diameter_alt3_grain"),
+            }
             for grain in valid_grains:
-                active_rows.append(
-                    {
-                        "Номер зерна": grain,
-                        "Рекомендовано исключить": len(recommended_exclusions.get(grain, [])),
-                        "Сейчас исключено": len(st.session_state.get(f"applied_exclude_diameter_grain_{grain}", [])),
-                    }
-                )
-            st.dataframe(pd.DataFrame(active_rows), use_container_width=True, hide_index=True)
+                row = {"Номер зерна": grain}
+                has_data = False
+                for label, results_dict in cleaned_variants.items():
+                    result = results_dict.get(grain)
+                    if result is None:
+                        continue
+                    has_data = True
+                    row[f"R² {label}"] = result.metrics["R²"]
+                    row[f"RMSE {label}, °C"] = result.metrics["RMSE, °C"]
+                    row[f"MAPE {label}, %"] = result.metrics["MAPE, %"]
+                if has_data:
+                    compare_rows.append(row)
+            if compare_rows:
+                st.subheader("Сравнение трех вариантов по номерам зерна")
+                st.dataframe(pd.DataFrame(compare_rows), use_container_width=True, hide_index=True)
 
-            cleaned_diameter_results = build_cleaned_diameter_grain_results(prepared_df, valid_grains)
-            st.subheader("Универсальная модель по размеру зерна")
             try:
-                universal_params, coeff_df, universal_summary = fit_diameter_universal_grain_size_model(
-                    cleaned_diameter_results, variant="quadratic_full"
+                p1, _, _ = fit_diameter_universal_grain_size_model(cleaned_variants["Исходная"], variant="quadratic_full")
+                p2, _, _ = fit_diameter_universal_grain_size_model_alt2(cleaned_variants["Альтернатива 2"], variant="quadratic_full")
+                p3, _, _ = fit_diameter_universal_grain_size_model_alt3(cleaned_variants["Альтернатива 3"], variant="quadratic_full")
+                e1 = evaluate_diameter_universal_model(p1, cleaned_variants["Исходная"])
+                e2 = evaluate_diameter_universal_model_alt2(p2, cleaned_variants["Альтернатива 2"])
+                e3 = evaluate_diameter_universal_model_alt3(p3, cleaned_variants["Альтернатива 3"])
+                st.subheader("Сравнение универсальных версий")
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Вариант": "Исходная", **e1},
+                        {"Вариант": "Альтернатива 2", **e2},
+                        {"Вариант": "Альтернатива 3", **e3},
+                    ]),
+                    use_container_width=True,
+                    hide_index=True,
                 )
-                universal_eval = evaluate_diameter_universal_model(universal_params, cleaned_diameter_results)
-                meta_quality_df = pd.DataFrame(
-                    [
-                        {
-                            "R² для a(dg)": universal_params["r2_a"],
-                            "R² для b(dg)": universal_params["r2_b"],
-                            "R² для c(dg)": universal_params["r2_c"],
-                            "R² по T": universal_eval["R² по T"],
-                            "RMSE по T, °C": universal_eval["RMSE по T, °C"],
-                            "Количество точек": universal_eval["Количество точек"],
-                        }
-                    ]
-                )
-                st.dataframe(meta_quality_df, use_container_width=True, hide_index=True)
-                formula_text = (
-                    "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·ln((T - 550) / 350)\n"
-                    "a(dg) = alpha0 + alpha1·ln(dg) + alpha2·[ln(dg)]²\n"
-                    "b(dg) = beta0 + beta1·ln(dg) + beta2·[ln(dg)]²\n"
-                    "c(dg) = gamma0 + gamma1·ln(dg) + gamma2·[ln(dg)]²\n"
-                    f"alpha0 = {fmt_trimmed(universal_params['alpha0'], 4)}, alpha1 = {fmt_trimmed(universal_params['alpha1'], 4)}, alpha2 = {fmt_trimmed(universal_params['alpha2'], 4)}\n"
-                    f"beta0 = {fmt_trimmed(universal_params['beta0'], 4)}, beta1 = {fmt_trimmed(universal_params['beta1'], 4)}, beta2 = {fmt_trimmed(universal_params['beta2'], 4)}\n"
-                    f"gamma0 = {fmt_trimmed(universal_params['gamma0'], 4)}, gamma1 = {fmt_trimmed(universal_params['gamma1'], 4)}, gamma2 = {fmt_trimmed(universal_params['gamma2'], 4)}"
-                )
-                st.code(formula_text, language="text")
-                st.dataframe(coeff_df, use_container_width=True, hide_index=True)
-                with st.expander("Сводка по универсальной модели"):
-                    st.text(universal_summary)
-
-                st.subheader("Калькулятор температуры по универсальной модели")
-                with st.form(key="diameter_universal_form"):
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        tau_value = st.number_input("Время наработки τ для универсальной модели", min_value=1.0, value=1000.0, step=1.0, format="%.0f", key="diameter_universal_tau")
-                    with c2:
-                        d_value = st.number_input("Эквивалентный диаметр D для универсальной модели", min_value=0.01, value=10.0, step=0.01, format="%.2f", key="diameter_universal_D")
-                    with c3:
-                        grain_number = st.selectbox("Номер зерна для универсальной модели", sorted(GRAIN_SIZE_MM.keys()), key="diameter_universal_grain")
-                    submitted = st.form_submit_button("Рассчитать")
-                if submitted:
-                    try:
-                        temp_value = predict_temperature_diameter_universal(universal_params, d_value, tau_value, GRAIN_SIZE_MM[float(grain_number)])
-                        st.metric("Расчетная температура по универсальной модели, °C", format_temperature_interpretation(temp_value))
-                        if temp_value <= PHYSICAL_TEMP_MIN_C:
-                            st.caption("В универсальной модели диаметра порог 550 °C встроен в температурный фактор ln((T - 550) / 350).")
-                    except Exception as exc:
-                        st.error(f"Не удалось выполнить расчет по универсальной модели: {exc}")
             except Exception as exc:
-                st.error(f"Не удалось собрать универсальную модель по размеру зерна: {exc}")
+                st.warning(f"Не удалось полностью собрать сравнение универсальных моделей: {exc}")
 
 with anchor_tab:
     st.write(
