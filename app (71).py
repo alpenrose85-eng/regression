@@ -2494,14 +2494,12 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     )
 
     if calibration_file is None:
-        st.info("Загрузите файл калибровки, и программа покажет отклонения по всем моделям.")
+        st.info("Загрузите файл калибровки, и программа покажет отклонения по трем нужным моделям.")
         return
 
     try:
         calibration_raw_df = load_file(calibration_file)
         calibration_df = prepare_calibration_dataframe(calibration_raw_df)
-        base_calibration_result = fit_engineering_model(prepared_df, include_grain=True)
-        improved_calibration_result = fit_improved_model(prepared_df, include_grain=True)
         anchor_calibration_result = fit_anchor_saturation_model(prepared_df, include_grain=True)
         diameter_calibration_result = fit_diameter_growth_model(prepared_df, include_grain=True)
     except Exception as exc:
@@ -2511,8 +2509,6 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     with st.expander("Предпросмотр исходного файла калибровки"):
         st.dataframe(calibration_raw_df, use_container_width=True)
 
-    base_params = base_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
-    improved_params = improved_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
     anchor_params = anchor_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
     diameter_params = diameter_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
 
@@ -2527,28 +2523,6 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         return pd.Series(values, index=frame.index, dtype=float)
 
     result_df = calibration_df.copy()
-    result_df["T_базовая, °C"] = safe_apply(
-        result_df,
-        lambda D, tau, G, c_sigma: predict_temperature_engineering(base_params, D, tau, c_sigma, G),
-        "D",
-        "tau",
-        "G",
-        "c_sigma",
-    )
-    result_df["Δ базовая, °C"] = result_df["T_базовая, °C"] - result_df["T_assumed"]
-    result_df["|Δ| базовая, °C"] = result_df["Δ базовая, °C"].abs()
-
-    result_df["T_улучшенная, °C"] = safe_apply(
-        result_df,
-        lambda D, tau, G, c_sigma: predict_temperature_improved(improved_params, D, tau, c_sigma, G),
-        "D",
-        "tau",
-        "G",
-        "c_sigma",
-    )
-    result_df["Δ улучшенная, °C"] = result_df["T_улучшенная, °C"] - result_df["T_assumed"]
-    result_df["|Δ| улучшенная, °C"] = result_df["Δ улучшенная, °C"].abs()
-
     result_df["T_sigma по зерну, °C"] = safe_apply(
         result_df,
         lambda D, tau, G, c_sigma: predict_temperature_anchor_saturation(anchor_params, D, tau, c_sigma, G),
@@ -2559,6 +2533,16 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     )
     result_df["Δ sigma по зерну, °C"] = result_df["T_sigma по зерну, °C"] - result_df["T_assumed"]
     result_df["|Δ| sigma по зерну, °C"] = result_df["Δ sigma по зерну, °C"].abs()
+
+    result_df["T_вторая по проценту, °C"] = safe_apply(
+        result_df,
+        lambda tau, G, c_sigma: predict_temperature_sigma_formula(G, c_sigma, tau),
+        "tau",
+        "G",
+        "c_sigma",
+    )
+    result_df["Δ вторая по проценту, °C"] = result_df["T_вторая по проценту, °C"] - result_df["T_assumed"]
+    result_df["|Δ| вторая по проценту, °C"] = result_df["Δ вторая по проценту, °C"].abs()
 
     result_df["T_рост диаметра, °C"] = safe_apply(
         result_df,
@@ -2571,16 +2555,14 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     result_df["|Δ| рост диаметра, °C"] = result_df["Δ рост диаметра, °C"].abs()
 
     abs_error_columns = {
-        "Базовая модель": "|Δ| базовая, °C",
-        "Улучшенная модель": "|Δ| улучшенная, °C",
-        "Sigma-модель по зерну": "|Δ| sigma по зерну, °C",
         "Модель роста диаметра": "|Δ| рост диаметра, °C",
+        "Sigma-модель по зерну": "|Δ| sigma по зерну, °C",
+        "Вторая модель по проценту": "|Δ| вторая по проценту, °C",
     }
     delta_columns = {
-        "Базовая модель": "Δ базовая, °C",
-        "Улучшенная модель": "Δ улучшенная, °C",
-        "Sigma-модель по зерну": "Δ sigma по зерну, °C",
         "Модель роста диаметра": "Δ рост диаметра, °C",
+        "Sigma-модель по зерну": "Δ sigma по зерну, °C",
+        "Вторая модель по проценту": "Δ вторая по проценту, °C",
     }
 
     def choose_best_model(row: pd.Series) -> str:
@@ -2592,10 +2574,9 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     result_df["Лучшая модель по точке"] = result_df.apply(choose_best_model, axis=1)
 
     unavailable_counts = {
-        "Базовая модель": int(result_df["T_базовая, °C"].isna().sum()),
-        "Улучшенная модель": int(result_df["T_улучшенная, °C"].isna().sum()),
-        "Sigma-модель по зерну": int(result_df["T_sigma по зерну, °C"].isna().sum()),
         "Модель роста диаметра": int(result_df["T_рост диаметра, °C"].isna().sum()),
+        "Sigma-модель по зерну": int(result_df["T_sigma по зерну, °C"].isna().sum()),
+        "Вторая модель по проценту": int(result_df["T_вторая по проценту, °C"].isna().sum()),
     }
     unavailable_total = sum(unavailable_counts.values())
     if unavailable_total > 0:
@@ -2607,16 +2588,14 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     def highlight_calibration_row(row: pd.Series) -> list[str]:
         styles = [""] * len(row)
         temp_columns = [
-            "T_базовая, °C",
-            "T_улучшенная, °C",
-            "T_sigma по зерну, °C",
             "T_рост диаметра, °C",
+            "T_sigma по зерну, °C",
+            "T_вторая по проценту, °C",
         ]
         delta_columns_local = [
-            "Δ базовая, °C",
-            "Δ улучшенная, °C",
-            "Δ sigma по зерну, °C",
             "Δ рост диаметра, °C",
+            "Δ sigma по зерну, °C",
+            "Δ вторая по проценту, °C",
         ]
         finite_errors = {col: abs(float(row[col])) for col in delta_columns_local if col in row.index and is_finite_number(row[col])}
         best_error = min(finite_errors.values()) if finite_errors else None
@@ -2652,14 +2631,12 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         "G",
         "c_sigma",
         "T_assumed",
-        "T_базовая, °C",
-        "Δ базовая, °C",
-        "T_улучшенная, °C",
-        "Δ улучшенная, °C",
-        "T_sigma по зерну, °C",
-        "Δ sigma по зерну, °C",
         "T_рост диаметра, °C",
         "Δ рост диаметра, °C",
+        "T_sigma по зерну, °C",
+        "Δ sigma по зерну, °C",
+        "T_вторая по проценту, °C",
+        "Δ вторая по проценту, °C",
         "Лучшая модель по точке",
     ]
     display_df = result_df[calibration_view_columns].rename(
@@ -2672,6 +2649,18 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
             "T_assumed": "Предполагаемая температура, °C",
         }
     )
+    display_round_columns = [
+        "Предполагаемая температура, °C",
+        "T_рост диаметра, °C",
+        "Δ рост диаметра, °C",
+        "T_sigma по зерну, °C",
+        "Δ sigma по зерну, °C",
+        "T_вторая по проценту, °C",
+        "Δ вторая по проценту, °C",
+    ]
+    for col in display_round_columns:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].round(0).astype("Int64")
     st.dataframe(
         display_df.style.apply(highlight_calibration_row, axis=1),
         use_container_width=True,
@@ -2680,7 +2669,7 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
     st.caption("Зелёным подсвечены лучшие/близкие значения, красным — наибольшие отклонения по строке.")
 
     best_model_counts = result_df["Лучшая модель по точке"].value_counts()
-    metric_cols = st.columns(4)
+    metric_cols = st.columns(3)
     for col, label in zip(metric_cols, abs_error_columns.keys()):
         with col:
             hits = int(best_model_counts.get(label, 0))
@@ -2707,6 +2696,15 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         ascending=[True, True, True],
     ).reset_index(drop=True)
     summary_df.index = summary_df.index + 1
+    summary_round_columns = [
+        "Среднее абсолютное отклонение, °C",
+        "Максимальное абсолютное отклонение, °C",
+        "Среднее отклонение, °C",
+        "Медиана |Δ|, °C",
+    ]
+    for col in summary_round_columns:
+        if col in summary_df.columns:
+            summary_df[col] = summary_df[col].round(0).astype("Int64")
 
     st.markdown("**Итог по близости к предполагаемой температуре**")
     def highlight_summary_row(row: pd.Series) -> list[str]:
