@@ -2602,22 +2602,24 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         worst_error = max(finite_errors.values()) if finite_errors else None
 
         for idx, col in enumerate(row.index):
-            if col in temp_columns and row.get(col) == row.get(col):
+            cell_value = row.get(col)
+            if col in temp_columns and is_finite_number(cell_value):
                 styles[idx] = "background-color: #f6f8fa;"
             if col in delta_columns_local:
-                value = row[col]
+                value = cell_value
                 if is_finite_number(value):
                     if abs(value) <= 10:
                         styles[idx] = "background-color: #e8f5e9; color: #1b5e20; font-weight: 600;"
                     elif abs(value) >= 30:
                         styles[idx] = "background-color: #ffebee; color: #b71c1c; font-weight: 600;"
                 if best_error is not None and worst_error is not None:
-                    abs_value = abs(float(value))
-                    if abs_value == best_error:
-                        styles[idx] = "background-color: #c8e6c9; color: #1b5e20; font-weight: 700;"
-                    elif abs_value == worst_error:
-                        styles[idx] = "background-color: #ffcdd2; color: #b71c1c; font-weight: 700;"
-            if col in temp_columns and not is_finite_number(row.get(col)):
+                    if is_finite_number(value):
+                        abs_value = abs(float(value))
+                        if abs_value == best_error:
+                            styles[idx] = "background-color: #c8e6c9; color: #1b5e20; font-weight: 700;"
+                        elif abs_value == worst_error:
+                            styles[idx] = "background-color: #ffcdd2; color: #b71c1c; font-weight: 700;"
+            if col in temp_columns and not is_finite_number(cell_value):
                 styles[idx] = "background-color: #eeeeee; color: #757575;"
             if col == "Лучшая модель по точке":
                 styles[idx] = "background-color: #fff3cd; color: #7a5d00; font-weight: 700;"
@@ -2649,7 +2651,13 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
             "T_assumed": "Предполагаемая температура, °C",
         }
     )
-    display_round_columns = [
+    if "Точка" in display_df.columns:
+        point_numeric = pd.to_numeric(display_df["Точка"], errors="coerce")
+        point_mask = point_numeric.notna()
+        display_df.loc[point_mask, "Точка"] = point_numeric[point_mask].round(0).astype("Int64").astype(str)
+    integer_round_columns = [
+        "Время, ч",
+        "Номер зерна",
         "Предполагаемая температура, °C",
         "T_рост диаметра, °C",
         "Δ рост диаметра, °C",
@@ -2658,9 +2666,16 @@ def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
         "T_вторая по проценту, °C",
         "Δ вторая по проценту, °C",
     ]
-    for col in display_round_columns:
+    decimal_round_columns = [
+        "Диаметр sigma",
+        "Sigma-фаза, %",
+    ]
+    for col in integer_round_columns:
         if col in display_df.columns:
             display_df[col] = display_df[col].round(0).astype("Int64")
+    for col in decimal_round_columns:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].round(2)
     st.dataframe(
         display_df.style.apply(highlight_calibration_row, axis=1),
         use_container_width=True,
