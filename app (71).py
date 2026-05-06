@@ -31,6 +31,8 @@ D_ALIASES = [
     "diameter",
     "particle_diameter",
     "equivalent_diameter",
+    "sigma_diameter",
+    "диаметр сигмы",
     "эквивалентный диаметр",
     "диаметр",
     "dэкв",
@@ -58,6 +60,8 @@ SIGMA_ALIASES = [
     "c_sigma",
     "sigma",
     "sigma_phase",
+    "sigma_pct",
+    "процент сигмы",
     "сигма",
     "содержание сигма-фазы",
     "c sigma",
@@ -65,6 +69,23 @@ SIGMA_ALIASES = [
     "c sigma pct",
 ]
 ID_ALIASES = ["id", "sample", "sample_id", "образец", "точка"]
+ASSUMED_TEMP_ALIASES = [
+    "предполагаемая температура",
+    "предполагаемая_t",
+    "предполагаемая t",
+    "расчетная температура",
+    "ожидаемая температура",
+    "ожидаемая t",
+    "target temperature",
+    "target_temperature",
+    "assumed temperature",
+    "assumed_temperature",
+    "expected temperature",
+    "expected_temperature",
+    "t_expected",
+    "t_assumed",
+    "t_target",
+]
 
 SIGMA_SATURATION_LIMIT = 18.0
 REAL_WORLD_POINT = {
@@ -224,6 +245,57 @@ def prepare_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     return prepared.reset_index(drop=True)
 
 
+def prepare_calibration_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
+    df = raw_df.copy()
+    df.columns = [str(col).strip() for col in df.columns]
+
+    mapping = {
+        "D": find_column(df.columns, D_ALIASES),
+        "tau": find_column(df.columns, TAU_ALIASES),
+        "G": find_column(df.columns, GRAIN_ALIASES),
+        "c_sigma": find_column(df.columns, SIGMA_ALIASES),
+        "T_assumed": find_column(df.columns, ASSUMED_TEMP_ALIASES),
+        "point_id": find_column(df.columns, ID_ALIASES),
+    }
+
+    required_missing = [key for key in ["D", "tau", "G", "c_sigma", "T_assumed"] if mapping[key] is None]
+    if required_missing:
+        raise ValueError(
+            "Не удалось автоматически распознать обязательные столбцы для калибровки: "
+            + ", ".join(required_missing)
+            + ". Нужны столбцы со временем, диаметром, номером зерна, процентом sigma-фазы и предполагаемой температурой."
+        )
+
+    prepared = pd.DataFrame(
+        {
+            "D": pd.to_numeric(df[mapping["D"]], errors="coerce"),
+            "tau": pd.to_numeric(df[mapping["tau"]], errors="coerce"),
+            "G": pd.to_numeric(df[mapping["G"]], errors="coerce"),
+            "c_sigma": pd.to_numeric(df[mapping["c_sigma"]], errors="coerce"),
+            "T_assumed": pd.to_numeric(df[mapping["T_assumed"]], errors="coerce"),
+        }
+    )
+
+    if mapping["point_id"] is not None:
+        prepared["point_id"] = df[mapping["point_id"]].astype(str)
+    else:
+        prepared["point_id"] = [f"Калибровка {i + 1}" for i in range(len(prepared))]
+
+    extra_columns = [col for col in df.columns if col not in set(mapping.values()) - {None}]
+    for col in extra_columns:
+        prepared[col] = df[col]
+
+    prepared = prepared.dropna(subset=["D", "tau", "G", "c_sigma", "T_assumed"]).copy()
+    prepared = prepared[(prepared["D"] > 0) & (prepared["tau"] > 0) & (prepared["c_sigma"] > 0)].copy()
+    prepared = prepared[prepared["G"] > 0].copy()
+    prepared = prepared[prepared["T_assumed"] > -273.15].copy()
+
+    if prepared.empty:
+        raise ValueError("После очистки не осталось корректных строк для калибровки. Проверьте данные и единицы измерения.")
+
+    return prepared.reset_index(drop=True)
+
+
 def sigma_saturation_feature(c_sigma: float, sigma_limit: float = SIGMA_SATURATION_LIMIT) -> float:
     if c_sigma <= 0:
         raise ValueError("Содержание сигма-фазы должно быть больше нуля.")
@@ -242,6 +314,35 @@ def sigma_remaining_feature(c_sigma: float, sigma_limit: float = SIGMA_SATURATIO
             f"Содержание сигма-фазы должно быть меньше предельного уровня {sigma_limit:.2f}% для кинетической модели."
         )
     return float(np.log((sigma_limit - c_sigma) / sigma_limit))
+
+
+def build_calibration_template_workbook() -> bytes:
+    template_df = pd.DataFrame(
+        [
+            {"point_id": "К1", "tau": 1000, "D": 4.2, "G": 8, "c_sigma": 3.5, "предполагаемая температура": 620},
+            {"point_id": "К2", "tau": 5000, "D": 7.1, "G": 9, "c_sigma": 8.2, "предполагаемая температура": 660},
+            {"point_id": "К3", "tau": 12000, "D": 9.4, "G": 10, "c_sigma": 12.6, "предполагаемая температура": 690},
+        ]
+    )
+    help_df = pd.DataFrame(
+        {
+            "Поле": ["point_id", "tau", "D", "G", "c_sigma", "предполагаемая температура"],
+            "Описание": [
+                "Идентификатор точки (необязательно)",
+                "Время / наработка",
+                "Эквивалентный диаметр sigma",
+                "Номер зерна",
+                "Процент sigma-фазы",
+                "Температура, с которой сравниваем модели",
+            ],
+        }
+    )
+
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        template_df.to_excel(writer, index=False, sheet_name="Калибровка")
+        help_df.to_excel(writer, index=False, sheet_name="Описание")
+    return buffer.getvalue()
 
 
 def approximation_reliability(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -2360,6 +2461,275 @@ def show_multi_calculator(
         st.error(f"Не удалось выполнить расчет: {exc}")
 
 
+def render_calibration_tab(prepared_df: pd.DataFrame) -> None:
+    st.subheader("Калибровка программы")
+    st.caption(
+        "Загрузите Excel/CSV с контрольными точками. Раздел сравнит предполагаемую температуру с расчетом по моделям "
+        "и покажет, какая из них ближе к ожидаемым значениям."
+    )
+    st.info(
+        "Ожидаемые столбцы: время (tau), диаметр (D), номер зерна (G), процент sigma-фазы (c_sigma), предполагаемая температура. "
+        "Названия могут быть русскими или латиницей."
+    )
+
+    template_bytes = build_calibration_template_workbook()
+    c_template, c_hint = st.columns([1, 2])
+    with c_template:
+        st.download_button(
+            "Скачать шаблон Excel",
+            data=template_bytes,
+            file_name="shablon_kalibrovki_regressiya.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_calibration_template",
+            use_container_width=True,
+        )
+    with c_hint:
+        st.caption("В шаблоне уже есть пример строк и отдельный лист с описанием столбцов.")
+
+    calibration_file = st.file_uploader(
+        "Файл для калибровки",
+        type=["xls", "xlsx", "csv"],
+        key="calibration_file_uploader",
+        help="Например: время, диаметр сигмы, номер зерна, процент сигмы, предполагаемая температура.",
+    )
+
+    if calibration_file is None:
+        st.info("Загрузите файл калибровки, и программа покажет отклонения по всем моделям.")
+        return
+
+    try:
+        calibration_raw_df = load_file(calibration_file)
+        calibration_df = prepare_calibration_dataframe(calibration_raw_df)
+        base_calibration_result = fit_engineering_model(prepared_df, include_grain=True)
+        improved_calibration_result = fit_improved_model(prepared_df, include_grain=True)
+        anchor_calibration_result = fit_anchor_saturation_model(prepared_df, include_grain=True)
+        diameter_calibration_result = fit_diameter_growth_model(prepared_df, include_grain=True)
+    except Exception as exc:
+        st.error(f"Не удалось выполнить калибровку: {exc}")
+        return
+
+    with st.expander("Предпросмотр исходного файла калибровки"):
+        st.dataframe(calibration_raw_df, use_container_width=True)
+
+    base_params = base_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
+    improved_params = improved_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
+    anchor_params = anchor_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
+    diameter_params = diameter_calibration_result.params.set_index("Параметр модели")["Значение"].to_dict()
+
+    def safe_apply(frame: pd.DataFrame, predictor, *columns: str) -> pd.Series:
+        values: list[float] = []
+        for _, row in frame.iterrows():
+            try:
+                args = [float(row[col]) for col in columns]
+                values.append(float(predictor(*args)))
+            except Exception:
+                values.append(np.nan)
+        return pd.Series(values, index=frame.index, dtype=float)
+
+    result_df = calibration_df.copy()
+    result_df["T_базовая, °C"] = safe_apply(
+        result_df,
+        lambda D, tau, G, c_sigma: predict_temperature_engineering(base_params, D, tau, c_sigma, G),
+        "D",
+        "tau",
+        "G",
+        "c_sigma",
+    )
+    result_df["Δ базовая, °C"] = result_df["T_базовая, °C"] - result_df["T_assumed"]
+    result_df["|Δ| базовая, °C"] = result_df["Δ базовая, °C"].abs()
+
+    result_df["T_улучшенная, °C"] = safe_apply(
+        result_df,
+        lambda D, tau, G, c_sigma: predict_temperature_improved(improved_params, D, tau, c_sigma, G),
+        "D",
+        "tau",
+        "G",
+        "c_sigma",
+    )
+    result_df["Δ улучшенная, °C"] = result_df["T_улучшенная, °C"] - result_df["T_assumed"]
+    result_df["|Δ| улучшенная, °C"] = result_df["Δ улучшенная, °C"].abs()
+
+    result_df["T_sigma по зерну, °C"] = safe_apply(
+        result_df,
+        lambda D, tau, G, c_sigma: predict_temperature_anchor_saturation(anchor_params, D, tau, c_sigma, G),
+        "D",
+        "tau",
+        "G",
+        "c_sigma",
+    )
+    result_df["Δ sigma по зерну, °C"] = result_df["T_sigma по зерну, °C"] - result_df["T_assumed"]
+    result_df["|Δ| sigma по зерну, °C"] = result_df["Δ sigma по зерну, °C"].abs()
+
+    result_df["T_рост диаметра, °C"] = safe_apply(
+        result_df,
+        lambda D, tau, G: predict_temperature_diameter_grain_model(diameter_params, D, tau, G),
+        "D",
+        "tau",
+        "G",
+    )
+    result_df["Δ рост диаметра, °C"] = result_df["T_рост диаметра, °C"] - result_df["T_assumed"]
+    result_df["|Δ| рост диаметра, °C"] = result_df["Δ рост диаметра, °C"].abs()
+
+    abs_error_columns = {
+        "Базовая модель": "|Δ| базовая, °C",
+        "Улучшенная модель": "|Δ| улучшенная, °C",
+        "Sigma-модель по зерну": "|Δ| sigma по зерну, °C",
+        "Модель роста диаметра": "|Δ| рост диаметра, °C",
+    }
+    delta_columns = {
+        "Базовая модель": "Δ базовая, °C",
+        "Улучшенная модель": "Δ улучшенная, °C",
+        "Sigma-модель по зерну": "Δ sigma по зерну, °C",
+        "Модель роста диаметра": "Δ рост диаметра, °C",
+    }
+
+    def choose_best_model(row: pd.Series) -> str:
+        candidates = {label: row[col] for label, col in abs_error_columns.items() if is_finite_number(row[col])}
+        if not candidates:
+            return "Нет расчета"
+        return min(candidates, key=candidates.get)
+
+    result_df["Лучшая модель по точке"] = result_df.apply(choose_best_model, axis=1)
+
+    unavailable_counts = {
+        "Базовая модель": int(result_df["T_базовая, °C"].isna().sum()),
+        "Улучшенная модель": int(result_df["T_улучшенная, °C"].isna().sum()),
+        "Sigma-модель по зерну": int(result_df["T_sigma по зерну, °C"].isna().sum()),
+        "Модель роста диаметра": int(result_df["T_рост диаметра, °C"].isna().sum()),
+    }
+    unavailable_total = sum(unavailable_counts.values())
+    if unavailable_total > 0:
+        st.warning(
+            "Для части строк некоторые модели не дали расчет. "
+            + "; ".join(f"{label}: {count}" for label, count in unavailable_counts.items() if count > 0)
+        )
+
+    def highlight_calibration_row(row: pd.Series) -> list[str]:
+        styles = [""] * len(row)
+        temp_columns = [
+            "T_базовая, °C",
+            "T_улучшенная, °C",
+            "T_sigma по зерну, °C",
+            "T_рост диаметра, °C",
+        ]
+        delta_columns_local = [
+            "Δ базовая, °C",
+            "Δ улучшенная, °C",
+            "Δ sigma по зерну, °C",
+            "Δ рост диаметра, °C",
+        ]
+        abs_columns_local = [
+            "|Δ| базовая, °C",
+            "|Δ| улучшенная, °C",
+            "|Δ| sigma по зерну, °C",
+            "|Δ| рост диаметра, °C",
+        ]
+
+        finite_errors = {col: row[col] for col in abs_columns_local if is_finite_number(row[col])}
+        best_error = min(finite_errors.values()) if finite_errors else None
+        worst_error = max(finite_errors.values()) if finite_errors else None
+
+        for idx, col in enumerate(row.index):
+            if col in temp_columns and row.get(col) == row.get(col):
+                styles[idx] = "background-color: #f6f8fa;"
+            if col in delta_columns_local:
+                value = row[col]
+                if is_finite_number(value):
+                    if abs(value) <= 10:
+                        styles[idx] = "background-color: #e8f5e9; color: #1b5e20; font-weight: 600;"
+                    elif abs(value) >= 30:
+                        styles[idx] = "background-color: #ffebee; color: #b71c1c; font-weight: 600;"
+            if col in abs_columns_local and best_error is not None and worst_error is not None:
+                value = row[col]
+                if not is_finite_number(value):
+                    styles[idx] = "background-color: #eeeeee; color: #757575;"
+                elif value == best_error:
+                    styles[idx] = "background-color: #c8e6c9; color: #1b5e20; font-weight: 700;"
+                elif value == worst_error:
+                    styles[idx] = "background-color: #ffcdd2; color: #b71c1c; font-weight: 700;"
+            if col == "Лучшая модель по точке":
+                styles[idx] = "background-color: #fff3cd; color: #7a5d00; font-weight: 700;"
+        return styles
+
+    st.markdown("**Таблица калибровки по точкам**")
+    calibration_view_columns = [
+        "point_id",
+        "tau",
+        "D",
+        "G",
+        "c_sigma",
+        "T_assumed",
+        "T_базовая, °C",
+        "Δ базовая, °C",
+        "T_улучшенная, °C",
+        "Δ улучшенная, °C",
+        "T_sigma по зерну, °C",
+        "Δ sigma по зерну, °C",
+        "T_рост диаметра, °C",
+        "Δ рост диаметра, °C",
+        "Лучшая модель по точке",
+    ]
+    display_df = result_df[calibration_view_columns].rename(
+        columns={
+            "point_id": "Точка",
+            "tau": "Время, ч",
+            "D": "Диаметр sigma",
+            "G": "Номер зерна",
+            "c_sigma": "Sigma-фаза, %",
+            "T_assumed": "Предполагаемая температура, °C",
+        }
+    )
+    st.dataframe(
+        display_df.style.apply(highlight_calibration_row, axis=1),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("Зелёным подсвечены лучшие/близкие значения, красным — наибольшие отклонения по строке.")
+
+    best_model_counts = result_df["Лучшая модель по точке"].value_counts()
+    metric_cols = st.columns(4)
+    for col, label in zip(metric_cols, abs_error_columns.keys()):
+        with col:
+            hits = int(best_model_counts.get(label, 0))
+            mean_abs = float(result_df[abs_error_columns[label]].mean())
+            st.metric(label, f"{mean_abs:.2f} °C", f"лучших точек: {hits}")
+
+    summary_rows = []
+    for label, abs_col in abs_error_columns.items():
+        signed_col = delta_columns[label]
+        summary_rows.append(
+            {
+                "Модель": label,
+                "Количество точек": len(result_df),
+                "Среднее абсолютное отклонение, °C": float(result_df[abs_col].mean()),
+                "Максимальное абсолютное отклонение, °C": float(result_df[abs_col].max()),
+                "Среднее отклонение, °C": float(result_df[signed_col].mean()),
+                "Медиана |Δ|, °C": float(result_df[abs_col].median()),
+                "Лучших попаданий": int((result_df["Лучшая модель по точке"] == label).sum()),
+                "Без расчета": int(result_df[abs_col].isna().sum()),
+            }
+        )
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        by=["Среднее абсолютное отклонение, °C", "Медиана |Δ|, °C", "Максимальное абсолютное отклонение, °C"],
+        ascending=[True, True, True],
+    ).reset_index(drop=True)
+    summary_df.index = summary_df.index + 1
+
+    st.markdown("**Итог по близости к предполагаемой температуре**")
+    def highlight_summary_row(row: pd.Series) -> list[str]:
+        if row.name == 1:
+            return ["background-color: #c8e6c9; color: #1b5e20; font-weight: 700;"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(summary_df.style.apply(highlight_summary_row, axis=1), use_container_width=True)
+
+    best_model = summary_df.iloc[0]
+    st.success(
+        f"Сейчас ближе всего к предполагаемым температурам работает: {best_model['Модель']}. "
+        f"Среднее абсолютное отклонение = {best_model['Среднее абсолютное отклонение, °C']:.2f} °C."
+    )
+
+
 def render_universal_models_tab(prepared_df: pd.DataFrame, valid_grains: list[float]) -> None:
     st.subheader("Универсальные модели по размеру зерна")
     st.markdown(f"**Научное обоснование:** {SCIENTIFIC_UNIVERSAL_SIGMA_PARAGRAPH}")
@@ -2945,7 +3315,7 @@ if diameter_result is not None:
 if anchor_result is not None:
     enrich_real_point_metrics(anchor_result, predict_temperature_anchor_saturation)
 
-main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab, universal_models_tab, sigma_formula_tab, report_tab = st.tabs([
+main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calculator_tab, calibration_tab, universal_models_tab, sigma_formula_tab, report_tab = st.tabs([
     "Общая модель",
     "Модели по номерам зерна",
     "Улучшенная модель",
@@ -2953,6 +3323,7 @@ main_tab, grain_tab, improved_tab, diameter_tab, anchor_tab, compare_tab, calcul
     "Простая sigma-модель",
     "Сравнение моделей",
     "Калькулятор",
+    "Калибровка программы",
     "Универсальные модели",
     "Вторая модель по проценту",
     "Данные для отчета",
@@ -3459,6 +3830,9 @@ with calculator_tab:
         st.error(f"Калькулятор sigma-модели по отдельным зернам недоступен: {anchor_error}")
     else:
         show_multi_calculator(base_result, improved_result, anchor_result, diameter_result)
+
+with calibration_tab:
+    render_calibration_tab(prepared_df)
 
 with universal_models_tab:
     render_universal_models_tab(prepared_df, valid_grains)
