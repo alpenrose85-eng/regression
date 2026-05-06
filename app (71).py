@@ -123,13 +123,13 @@ def diameter_temperature_factor_inverse(temp_feature: float | np.ndarray) -> flo
 
 
 def diameter_inverse_excess_temperature(temp_c: float | np.ndarray) -> float | np.ndarray:
-    effective_kelvin = np.asarray(temp_c, dtype=float) - PHYSICAL_TEMP_MIN_C + 273.15
-    return 1.0 / np.clip(effective_kelvin, 1e-9, None)
+    excess_temp_c = np.asarray(temp_c, dtype=float) - PHYSICAL_TEMP_MIN_C
+    return 1.0 / np.clip(excess_temp_c, 1e-9, None)
 
 
 def diameter_inverse_excess_temperature_inverse(temp_feature: float | np.ndarray) -> float | np.ndarray:
-    effective_kelvin = 1.0 / np.clip(np.asarray(temp_feature, dtype=float), 1e-12, None)
-    return PHYSICAL_TEMP_MIN_C - 273.15 + effective_kelvin
+    excess_temp_c = 1.0 / np.clip(np.asarray(temp_feature, dtype=float), 1e-12, None)
+    return PHYSICAL_TEMP_MIN_C + excess_temp_c
 
 SCIENTIFIC_UNIVERSAL_SIGMA_PARAGRAPH = (
     "Универсализированная модель содержания σ-фазы по размеру зерна строится по наиболее надежной части "
@@ -638,7 +638,7 @@ def fit_diameter_variant_model(df: pd.DataFrame, include_grain: bool, variant: s
             "param": "inv_T_excess",
             "feature_builder": lambda frame: diameter_inverse_excess_temperature(frame["T"]),
             "inverse_builder": diameter_inverse_excess_temperature_inverse,
-            "formula": "ln(D) = a + b·ln(τ) + c·(1 / (T - 550 + 273.15))",
+            "formula": "ln(D) = a + b·ln(τ) + c·(1 / (T - 550))",
             "label": "Альтернативная модель диаметра: обратная температура превышения",
             "summary": "Альтернативная модель диаметра с обратной температурой превышения порога",
         },
@@ -1546,7 +1546,7 @@ def fit_diameter_universal_grain_size_model_alt3(
         cleaned_results,
         variant=variant,
         temp_param_name="inv_T_excess",
-        formula_label="ln(D)=a(dg)+b(dg)·ln(τ)+c(dg)·(1/(T-550+273.15))",
+        formula_label="ln(D)=a(dg)+b(dg)·ln(τ)+c(dg)·(1/(T-550))",
     )
 
 
@@ -3924,7 +3924,7 @@ with diameter_tab:
                 fit_diameter_universal_grain_size_model_alt3,
                 evaluate_diameter_universal_model_alt3,
                 predict_temperature_diameter_universal_alt3,
-                "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1 / (T - 550 + 273.15))",
+                "ln(D) = a(dg) + b(dg)·ln(τ) + c(dg)·(1 / (T - 550))",
             )
 
         with compare_variants_tab:
